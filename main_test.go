@@ -255,6 +255,59 @@ func TestAuthorityFailureFailsClosed(t *testing.T) {
 	}
 }
 
+func TestSelectedAuthMetadataIsColdUnlessVerifiedBinding(t *testing.T) {
+	resetTestState()
+	selected, _ := json.Marshal(pluginapi.RequestInterceptRequest{RequestID: "cold", AuthID: "acct", Metadata: map[string]any{"selected_auth_id": "acct"}})
+	if _, err := interceptAfter(selected); err != nil {
+		t.Fatal(err)
+	}
+	state.mu.Lock()
+	if got := state.requests["cold"].lease.Class; got != classCold {
+		state.mu.Unlock()
+		t.Fatalf("selected-auth lease class = %v, want cold", got)
+	}
+	state.mu.Unlock()
+	verified, _ := json.Marshal(pluginapi.RequestInterceptRequest{RequestID: "warm", AuthID: "acct", Metadata: map[string]any{"cache_auth_id": "acct", "cache_verified": true}})
+	if _, err := interceptAfter(verified); err != nil {
+		t.Fatal(err)
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if got := state.requests["warm"].lease.Class; got != classWarm {
+		t.Fatalf("verified cache lease class = %v, want warm", got)
+	}
+}
+
+func TestPinnedAuthIsWarm(t *testing.T) {
+	resetTestState()
+	raw, _ := json.Marshal(pluginapi.RequestInterceptRequest{RequestID: "pinned", AuthID: "acct", Metadata: map[string]any{"pinned_auth_id": "acct"}})
+	if _, err := interceptAfter(raw); err != nil {
+		t.Fatal(err)
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if got := state.requests["pinned"].lease.Class; got != classWarm {
+		t.Fatalf("pinned lease class = %v, want warm", got)
+	}
+}
+
+func TestVerifiedBindingDoesNotMakeColdFailoverWarm(t *testing.T) {
+	resetTestState()
+	first, _ := json.Marshal(pluginapi.RequestInterceptRequest{RequestID: "retry", AuthID: "a", Metadata: map[string]any{"cache_auth_id": "a", "cache_verified": true}})
+	if _, err := interceptAfter(first); err != nil {
+		t.Fatal(err)
+	}
+	retry, _ := json.Marshal(pluginapi.RequestInterceptRequest{RequestID: "retry", AuthID: "b", Metadata: map[string]any{"cache_auth_id": "a", "cache_verified": true, "selected_auth_id": "b"}})
+	if _, err := interceptAfter(retry); err != nil {
+		t.Fatal(err)
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if got := state.requests["retry"].lease.Class; got != classCold {
+		t.Fatalf("failover lease class = %v, want cold", got)
+	}
+}
+
 type typedCapacityAuthority struct {
 	*localAuthority
 	mu   sync.Mutex
@@ -416,6 +469,45 @@ func TestRenewalFailureFencesUntilCompletion(t *testing.T) {
 	defer state.mu.Unlock()
 	if len(state.leases) != 0 {
 		t.Fatalf("lease retained after fenced completion: %d", len(state.leases))
+	}
+}
+
+type renewalFenceAuthority struct {
+	*renewalFailureAuthority
+	fenced chan Lease
+}
+
+func (a *renewalFenceAuthority) Fence(_ context.Context, lease Lease) error {
+	select {
+	case a.fenced <- lease:
+	default:
+	}
+	return nil
+}
+
+func TestRenewalLossAttemptsDistributedFence(t *testing.T) {
+	resetTestState()
+	base := &countingAuthority{localAuthority: newLocalAuthority()}
+	a := &renewalFenceAuthority{renewalFailureAuthority: &renewalFailureAuthority{countingAuthority: base}, fenced: make(chan Lease, 1)}
+	state.mu.Lock()
+	state.authority = a
+	state.mu.Unlock()
+	raw, _ := json.Marshal(pluginapi.RequestInterceptRequest{RequestID: "fence-distributed", AuthID: "acct"})
+	if _, err := interceptAfter(raw); err != nil {
+		t.Fatal(err)
+	}
+	state.mu.Lock()
+	rs := state.requests["fence-distributed"]
+	lease := rs.lease
+	state.mu.Unlock()
+	startHeartbeatWithInterval(rs, a, lease, time.Millisecond)
+	select {
+	case got := <-a.fenced:
+		if got.Token != lease.Token {
+			t.Fatalf("fenced token = %q, want %q", got.Token, lease.Token)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("renewal loss did not invoke distributed fence")
 	}
 }
 
@@ -625,8 +717,11 @@ func TestRedisFakeExpiryRenewalAndCrashRecovery(t *testing.T) {
 		t.Fatal("second acquire exceeded fake hard cap")
 	}
 	f.expire(one.Token)
-	if _, err = a.Acquire(context.Background(), "acct", 1, 0, classWarm); err != nil {
-		t.Fatalf("expired lease did not recover: %v", err)
+	if _, err = a.Acquire(context.Background(), "acct", 1, 0, classWarm); !errors.Is(err, ErrAuthorityUnavailable) {
+		t.Fatalf("expired lease acquire error = %v, want authority unavailable", err)
+	}
+	if err = a.Release(context.Background(), one); err != nil {
+		t.Fatal(err)
 	}
 	// A live lease is extended by renewal and remains occupied.
 	live, err := a.Acquire(context.Background(), "other", 2, 0, classWarm)
@@ -651,6 +746,22 @@ func TestRedisFakeExpiryRenewalAndCrashRecovery(t *testing.T) {
 type recordingRedis struct {
 	acquireTTL, renewTTL int64
 	released             int
+}
+
+type fencedRedis struct{}
+
+func (fencedRedis) Eval(_ context.Context, script string, _ []string, _ ...any) (any, error) {
+	if script == redisAcquireScript {
+		return int64(-1), nil
+	}
+	return []any{int64(0), int64(0), int64(0)}, nil
+}
+
+func TestRedisAcquireAfterExpiryFenceFailsClosedForAnotherInstance(t *testing.T) {
+	a := newRedisAuthority(fencedRedis{}, "cpa:test")
+	if _, err := a.Acquire(context.Background(), "acct", 1, 0, classWarm); !errors.Is(err, ErrAuthorityUnavailable) {
+		t.Fatalf("fenced acquire error = %v, want authority unavailable", err)
+	}
 }
 
 func (f *recordingRedis) Eval(_ context.Context, script string, _ []string, args ...any) (any, error) {
@@ -686,6 +797,7 @@ type fakeRedisEntry struct {
 type leaseFakeRedis struct {
 	mu      sync.Mutex
 	entries map[string]fakeRedisEntry
+	fenced  bool
 }
 
 func newLeaseFakeRedis() *leaseFakeRedis {
@@ -702,7 +814,8 @@ func (f *leaseFakeRedis) expire(token string) {
 func (f *leaseFakeRedis) clean(now int64) {
 	for token, e := range f.entries {
 		if e.expiry <= now {
-			delete(f.entries, token)
+			f.fenced = true
+			_ = token
 		}
 	}
 }
@@ -718,6 +831,9 @@ func (f *leaseFakeRedis) Eval(_ context.Context, script string, keys []string, a
 	f.clean(now)
 	switch script {
 	case redisAcquireScript:
+		if f.fenced {
+			return int64(-1), nil
+		}
 		limit, _ := toInt64(args[0])
 		reserved, _ := toInt64(args[1])
 		class, _ := toInt64(args[2])
@@ -749,6 +865,9 @@ func (f *leaseFakeRedis) Eval(_ context.Context, script string, keys []string, a
 			return int64(0), nil
 		}
 		delete(f.entries, token)
+		if len(f.entries) == 0 {
+			f.fenced = false
+		}
 		return int64(1), nil
 	case redisSnapshotScript:
 		warm := 0
@@ -757,7 +876,11 @@ func (f *leaseFakeRedis) Eval(_ context.Context, script string, keys []string, a
 				warm++
 			}
 		}
-		return []any{int64(len(f.entries)), int64(warm)}, nil
+		fenced := int64(0)
+		if f.fenced {
+			fenced = 1
+		}
+		return []any{int64(len(f.entries)), int64(warm), fenced}, nil
 	default:
 		_ = keys
 		return nil, errors.New("unknown script")

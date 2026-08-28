@@ -61,9 +61,10 @@ type registration struct {
 	Capabilities  registrationCapabilities `json:"capabilities"`
 }
 type registrationCapabilities struct {
-	Scheduler              bool `json:"scheduler"`
-	RequestInterceptor     bool `json:"request_interceptor"`
-	RequestLifecyclePlugin bool `json:"request_lifecycle_plugin"`
+	Scheduler                           bool `json:"scheduler"`
+	RequestInterceptor                  bool `json:"request_interceptor"`
+	RequestInterceptorEnforcesAdmission bool `json:"request_interceptor_enforces_admission"`
+	RequestLifecyclePlugin              bool `json:"request_lifecycle_plugin"`
 }
 
 type pluginConfig struct {
@@ -296,7 +297,7 @@ func pluginRegistration() registration {
 		{Name: "redis_addr", Type: pluginapi.ConfigFieldTypeString, Description: "Redis address when authority is redis."},
 		{Name: "redis_password", Type: pluginapi.ConfigFieldTypeString, Description: "Redis password when authority is redis."},
 		{Name: "redis_db", Type: pluginapi.ConfigFieldTypeInteger, Description: "Redis database number."},
-	}}, Capabilities: registrationCapabilities{Scheduler: true, RequestInterceptor: true, RequestLifecyclePlugin: true}}
+	}}, Capabilities: registrationCapabilities{Scheduler: true, RequestInterceptor: true, RequestInterceptorEnforcesAdmission: true, RequestLifecyclePlugin: true}}
 }
 
 func schedulerPick(raw []byte) ([]byte, error) {
@@ -411,7 +412,13 @@ func interceptAfter(raw []byte) ([]byte, error) {
 		return okEnvelope(pluginapi.RequestInterceptResponse{Headers: req.Headers, Body: req.Body})
 	}
 	class := classCold
-	_, _, warm := affinityHint(req.Metadata)
+	hint, _, warm := affinityHint(req.Metadata)
+	// A verified binding reserves warm capacity only while executing on the
+	// bound original auth. Retries/failovers selected onto another auth are
+	// cold and must use general capacity.
+	if warm && hint != "" && hint != req.AuthID {
+		warm = false
+	}
 	if warm {
 		class = classWarm
 	}
@@ -560,6 +567,17 @@ func startHeartbeatWithInterval(rs *requestLifecycle, authority Authority, lease
 				err := authority.Renew(ctx, lease)
 				cancel()
 				if err != nil {
+					// Best-effort distributed fencing. Redis authorities persist this
+					// marker so another instance cannot acquire the account after the
+					// lease expires. If the partition also prevents Fence, the Redis
+					// acquire script fences on observing expiry.
+					if fencer, ok := authority.(interface {
+						Fence(context.Context, Lease) error
+					}); ok {
+						ctxFence, cancelFence := boundedAuthorityContext()
+						_ = fencer.Fence(ctxFence, lease)
+						cancelFence()
+					}
 					rs.terminal = true
 					rs.fenced = true
 					rs.mu.Unlock()
@@ -613,17 +631,30 @@ func affinityHint(metadata map[string]any) (hint string, strict, warm bool) {
 	if metadata == nil {
 		return
 	}
-	for _, key := range []string{"pinned_auth_id", "selected_auth_id", "session_auth_id", "affinity_auth_id", "cache_auth_id"} {
+	// Explicit pins/session bindings are warm/strict. selected_auth_id is only
+	// scheduler selection state and is deliberately never sufficient for warm
+	// classification (CPA publishes it on every retry).
+	explicit := false
+	for _, key := range []string{"pinned_auth_id", "session_auth_id", "affinity_auth_id"} {
 		if v, ok := metadata[key].(string); ok && canonicalAuthID(v) != "" {
 			hint = canonicalAuthID(v)
-			strict = key != "cache_auth_id"
-			warm = strict
+			strict, warm = true, true
+			explicit = true
 			break
 		}
 	}
-	if v, ok := metadata["cache_verified"].(bool); ok && v {
-		warm = hint != ""
-		strict = hint != ""
+	if hint == "" {
+		if v, ok := metadata["selected_auth_id"].(string); ok {
+			hint = canonicalAuthID(v)
+		}
+	}
+	if !explicit {
+		if v, ok := metadata["cache_auth_id"].(string); ok && canonicalAuthID(v) != "" {
+			if verified, _ := metadata["cache_verified"].(bool); verified {
+				hint = canonicalAuthID(v)
+				warm, strict = true, true
+			}
+		}
 	}
 	return
 }

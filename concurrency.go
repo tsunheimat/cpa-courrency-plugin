@@ -320,6 +320,11 @@ func (a *redisAuthority) Snapshot(ctx context.Context, account string, limit, re
 	}
 	inflight, _ := toInt(vals[0])
 	warm, _ := toInt(vals[1])
+	if len(vals) >= 3 {
+		if fenced, ok := toInt(vals[2]); ok && fenced != 0 {
+			return Usage{}, ErrAuthorityUnavailable
+		}
+	}
 	return Usage{Limit: limit, Reserved: reserved, InFlight: inflight, WarmFlight: warm}, nil
 }
 
@@ -335,6 +340,8 @@ func (a *redisAuthority) Acquire(ctx context.Context, account string, limit, res
 		return Lease{}, fmt.Errorf("%w: %v", ErrAuthorityUnavailable, err)
 	}
 	if n, ok := toInt(result); !ok {
+		return Lease{}, ErrAuthorityUnavailable
+	} else if n < 0 {
 		return Lease{}, ErrAuthorityUnavailable
 	} else if n == 0 {
 		return Lease{}, &AdmissionError{Code: "account_concurrency_limit", HTTPStatus: http.StatusServiceUnavailable, RetryAfter: defaultRetryAfter, Message: "account concurrency limit reached"}
@@ -371,6 +378,22 @@ func (a *redisAuthority) Renew(ctx context.Context, lease Lease) error {
 	return nil
 }
 
+// Fence marks an account as unsafe for further admission. The marker lives in
+// Redis, so it constrains every CPA instance that shares the authority rather
+// than relying on a process-local flag. A fenced account remains unavailable
+// until the stale lease is explicitly released (fail-closed recovery).
+func (a *redisAuthority) Fence(ctx context.Context, lease Lease) error {
+	if a == nil || a.client == nil {
+		return ErrAuthorityUnavailable
+	}
+	ctx, cancel := ensureAuthorityContext(ctx)
+	defer cancel()
+	if _, err := a.client.Eval(ctx, redisFenceScript, []string{a.key(lease.Key)}, lease.Token); err != nil {
+		return fmt.Errorf("%w: %v", ErrAuthorityUnavailable, err)
+	}
+	return nil
+}
+
 func ensureAuthorityContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	if ctx == nil {
 		return context.WithTimeout(context.Background(), authorityCallTimeout)
@@ -401,10 +424,11 @@ func toInt(v any) (int, bool) {
 	}
 }
 
-const redisSnapshotScript = `local now=tonumber(ARGV[1] or '0'); local fields=redis.call('HGETALL',KEYS[1]); local i=tonumber(redis.call('HGET',KEYS[1],'inflight') or '0'); local w=tonumber(redis.call('HGET',KEYS[1],'warm') or '0'); for n=1,#fields,2 do local f=fields[n]; local v=fields[n+1]; if f~='inflight' and f~='warm' then local c,e=string.match(v,'^(%d+):(%d+)$'); if c and tonumber(e)<=now then redis.call('HDEL',KEYS[1],f); i=i-1; if tonumber(c)==1 then w=w-1 end end end end; if i<0 then i=0 end; if w<0 then w=0 end; redis.call('HSET',KEYS[1],'inflight',i,'warm',w); if i>0 then redis.call('PEXPIRE',KEYS[1],ARGV[2]) else redis.call('DEL',KEYS[1]) end; return {i,w}`
-const redisAcquireScript = `local now=tonumber(ARGV[5]); local ttl=tonumber(ARGV[6]); local fields=redis.call('HGETALL',KEYS[1]); local i=tonumber(redis.call('HGET',KEYS[1],'inflight') or '0'); local w=tonumber(redis.call('HGET',KEYS[1],'warm') or '0'); for n=1,#fields,2 do local f=fields[n]; local v=fields[n+1]; if f~='inflight' and f~='warm' then local c,e=string.match(v,'^(%d+):(%d+)$'); if c and tonumber(e)<=now then redis.call('HDEL',KEYS[1],f); i=i-1; if tonumber(c)==1 then w=w-1 end end end end; if i<0 then i=0 end; if w<0 then w=0 end; local limit=tonumber(ARGV[1]); local reserved=tonumber(ARGV[2]); local class=tonumber(ARGV[3]); local allowed=limit; if class==0 then allowed=limit-reserved; if allowed<1 then allowed=1 end end; if i>=allowed then redis.call('HSET',KEYS[1],'inflight',i,'warm',w); if i>0 then redis.call('PEXPIRE',KEYS[1],ttl) end; return 0 end; i=i+1; if class==1 then w=w+1 end; redis.call('HSET',KEYS[1],'inflight',i,'warm',w,ARGV[4],class..':'..(now+ttl)); redis.call('PEXPIRE',KEYS[1],ttl); return 1`
-const redisReleaseScript = `local v=redis.call('HGET',KEYS[1],ARGV[1]); if not v then return 0 end; local c=string.match(v,'^(%d+):'); if not c then c=v end; redis.call('HDEL',KEYS[1],ARGV[1]); local i=tonumber(redis.call('HGET',KEYS[1],'inflight') or '0')-1; local w=tonumber(redis.call('HGET',KEYS[1],'warm') or '0'); if tonumber(c)==1 then w=w-1 end; if i<=0 then redis.call('DEL',KEYS[1]); else if w<0 then w=0 end; redis.call('HSET',KEYS[1],'inflight',i,'warm',w); redis.call('PEXPIRE',KEYS[1],ARGV[3]); end; return 1`
-const redisRenewScript = `local v=redis.call('HGET',KEYS[1],ARGV[1]); if not v then return 0 end; local c=string.match(v,'^(%d+):'); if not c then return 0 end; local now=tonumber(ARGV[2]); local ttl=tonumber(ARGV[3]); local _,e=string.match(v,'^(%d+):(%d+)$'); if not e or tonumber(e)<=now then return 0 end; redis.call('HSET',KEYS[1],ARGV[1],c..':'..(now+ttl)); redis.call('PEXPIRE',KEYS[1],ttl); return 1`
+const redisSnapshotScript = `local now=tonumber(ARGV[1] or '0'); local fields=redis.call('HGETALL',KEYS[1]); local i=tonumber(redis.call('HGET',KEYS[1],'inflight') or '0'); local w=tonumber(redis.call('HGET',KEYS[1],'warm') or '0'); local fenced=redis.call('HEXISTS',KEYS[1],'__fenced'); for n=1,#fields,2 do local f=fields[n]; local v=fields[n+1]; if f~='inflight' and f~='warm' and f~='__fenced' then local c,e=string.match(v,'^(%d+):(%d+)$'); if c and tonumber(e)<=now then redis.call('HSET',KEYS[1],'__fenced','1'); fenced=1 end end end; if i<0 then i=0 end; if w<0 then w=0 end; redis.call('HSET',KEYS[1],'inflight',i,'warm',w); if i>0 or fenced==1 then redis.call('PERSIST',KEYS[1]); return {i,w,fenced} else redis.call('DEL',KEYS[1]); return {0,0,0} end`
+const redisAcquireScript = `local now=tonumber(ARGV[5]); local ttl=tonumber(ARGV[6]); local fields=redis.call('HGETALL',KEYS[1]); local i=tonumber(redis.call('HGET',KEYS[1],'inflight') or '0'); local w=tonumber(redis.call('HGET',KEYS[1],'warm') or '0'); local fenced=redis.call('HEXISTS',KEYS[1],'__fenced'); for n=1,#fields,2 do local f=fields[n]; local v=fields[n+1]; if f~='inflight' and f~='warm' and f~='__fenced' then local c,e=string.match(v,'^(%d+):(%d+)$'); if c and tonumber(e)<=now then redis.call('HSET',KEYS[1],'__fenced','1'); fenced=1 end end end; if fenced==1 then redis.call('PERSIST',KEYS[1]); return -1 end; if i<0 then i=0 end; if w<0 then w=0 end; local limit=tonumber(ARGV[1]); local reserved=tonumber(ARGV[2]); local class=tonumber(ARGV[3]); local allowed=limit; if class==0 then allowed=limit-reserved; if allowed<1 then allowed=1 end end; if i>=allowed then redis.call('HSET',KEYS[1],'inflight',i,'warm',w); redis.call('PERSIST',KEYS[1]); return 0 end; i=i+1; if class==1 then w=w+1 end; redis.call('HSET',KEYS[1],'inflight',i,'warm',w,ARGV[4],class..':'..(now+ttl)); redis.call('PERSIST',KEYS[1]); return 1`
+const redisReleaseScript = `local v=redis.call('HGET',KEYS[1],ARGV[1]); if not v then return 0 end; local c=string.match(v,'^(%d+):'); if not c then c=v end; redis.call('HDEL',KEYS[1],ARGV[1]); local i=tonumber(redis.call('HGET',KEYS[1],'inflight') or '0')-1; local w=tonumber(redis.call('HGET',KEYS[1],'warm') or '0'); if tonumber(c)==1 then w=w-1 end; if i<=0 then redis.call('DEL',KEYS[1]); else if w<0 then w=0 end; redis.call('HSET',KEYS[1],'inflight',i,'warm',w); end; return 1`
+const redisRenewScript = `local v=redis.call('HGET',KEYS[1],ARGV[1]); if not v then return 0 end; local c=string.match(v,'^(%d+):'); if not c then return 0 end; local now=tonumber(ARGV[2]); local ttl=tonumber(ARGV[3]); local _,e=string.match(v,'^(%d+):(%d+)$'); if not e or tonumber(e)<=now then return 0 end; redis.call('HSET',KEYS[1],ARGV[1],c..':'..(now+ttl)); redis.call('PERSIST',KEYS[1]); return 1`
+const redisFenceScript = `if redis.call('HEXISTS',KEYS[1],ARGV[1])==1 then redis.call('HSET',KEYS[1],'__fenced','1'); return 1 end; return 0`
 
 type candidateScore struct {
 	id       string

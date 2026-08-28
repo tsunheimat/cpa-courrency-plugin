@@ -34,10 +34,13 @@ an unverified `prompt_cache_key`-style hint) can consume only general capacity.
 Admission waits at most `wait_timeout`; there is no unbounded internal queue.
 The scheduler chooses the least-loaded currently available candidate, with
 stable candidate-order tie breaking. A strict affinity hint (`pinned_auth_id`,
-`selected_auth_id`, `session_auth_id`, `affinity_auth_id`, or a host-provided
-`cache_auth_id`) is retained when that account is available. A cache hint is not
-treated as verified warm affinity unless the host also supplies a verified
-binding.
+`session_auth_id`, or `affinity_auth_id`) is retained when that account is
+available. `selected_auth_id` is selection state published by CPA on every
+attempt and is never sufficient for warm classification. A host-provided
+`cache_auth_id` is warm only when paired with `cache_verified: true`; the normal
+CPA session-affinity selector publishes that pair only on a validated cache hit.
+On a retry/failover, the binding must match the selected auth or the attempt is
+cold and uses general capacity.
 
 ## Authority modes
 
@@ -81,11 +84,29 @@ failures. Newapi should treat `account_concurrency_limit` as eligible for
 bounded channel-level failover, without classifying it as provider 429.
 
 CPA host compatibility: schema version 2 or newer is required for terminal
-`request.complete` callbacks. This task's host extension adds `AuthID` and
+`request.complete` callbacks. This task's host/SDK contract adds
+`request_interceptor_enforces_admission` to registration capabilities. When it
+is true, interceptor RPC/process errors, fusing, unavailable callbacks, or an
+incompatible schema terminate the request with typed
+`account_concurrency_authority_unavailable` (HTTP 503); ordinary interceptors
+retain the historical fail-open behavior. The extension also adds `AuthID` and
 `AuthProvider` to post-auth interceptor requests and exposes plugin RPC error
 `Code`, `Class`, `Retryable`, and `StatusCode` methods. Hosts must preserve those
 typed fields across the plugin boundary; newapi must not parse human-readable
 messages.
+
+Set the host-side plugin instance option `admission-enforcing: true` for this
+plugin. That explicit requirement keeps the provider path fail-closed while the
+plugin is loading or if registration fails; leave it unset for ordinary
+non-enforcement plugins.
+
+Redis lease records are deliberately fail-closed across partitions. If renewal
+is lost, the plugin marks the account fenced in Redis; an acquire from any CPA
+instance returns `account_concurrency_authority_unavailable` (and an expired
+lease is fenced when observed) until the stale lease is explicitly released.
+Redis keys are therefore not reclaimed automatically: a crashed holder may
+require operational cleanup, which is the availability trade-off required to
+preserve the hard cap without relying on a local process flag.
 
 ## Build and test
 
