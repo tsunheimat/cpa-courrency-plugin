@@ -14,6 +14,20 @@ import (
 )
 
 func resetTestState() {
+	state.gate.Lock()
+	defer state.gate.Unlock()
+	state.mu.Lock()
+	oldRequests := make([]*requestLifecycle, 0, len(state.requests))
+	for _, rs := range state.requests {
+		oldRequests = append(oldRequests, rs)
+	}
+	state.mu.Unlock()
+	for _, rs := range oldRequests {
+		rs.mu.Lock()
+		rs.terminal = true
+		stopHeartbeat(rs)
+		rs.mu.Unlock()
+	}
 	state.mu.Lock()
 	state.cfg = pluginConfig{Enabled: true, MaxConcurrency: 2, WarmReservedSlots: 1, WaitTimeout: 2 * time.Millisecond, Authority: "local"}
 	state.authority = newLocalAuthority()
@@ -21,6 +35,7 @@ func resetTestState() {
 	state.bound = make(map[string]string)
 	state.requests = make(map[string]*requestLifecycle)
 	state.stopping = false
+	state.uncertain = false
 	state.mu.Unlock()
 }
 
@@ -238,6 +253,252 @@ func TestAuthorityFailureFailsClosed(t *testing.T) {
 	if !resp.Terminate || resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("resp = %#v", resp)
 	}
+}
+
+type typedCapacityAuthority struct {
+	*localAuthority
+	mu   sync.Mutex
+	full bool
+}
+
+type renewalFailureAuthority struct {
+	*countingAuthority
+}
+
+func (a *renewalFailureAuthority) Renew(context.Context, Lease) error {
+	a.mu.Lock()
+	a.renews++
+	a.mu.Unlock()
+	return errors.New("renew transport failed")
+}
+
+func (a *typedCapacityAuthority) Acquire(ctx context.Context, key string, limit, reserved int, class requestClass) (Lease, error) {
+	a.mu.Lock()
+	full := a.full
+	a.mu.Unlock()
+	if full {
+		return Lease{}, &AdmissionError{Code: "account_concurrency_limit", HTTPStatus: http.StatusServiceUnavailable, RetryAfter: 1, Message: "account concurrency limit reached"}
+	}
+	return a.localAuthority.Acquire(ctx, key, limit, reserved, class)
+}
+
+func TestCapacityRejectionDoesNotPoisonAuthorityAndRecoversAfterRelease(t *testing.T) {
+	resetTestState()
+	base := newLocalAuthority()
+	hold, err := base.Acquire(context.Background(), accountKey("cpa", "acct"), 2, 1, classWarm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &typedCapacityAuthority{localAuthority: base, full: true}
+	state.mu.Lock()
+	state.authority = a
+	state.mu.Unlock()
+	raw, _ := json.Marshal(pluginapi.RequestInterceptRequest{RequestID: "capacity-1", AuthID: "acct"})
+	for i := 0; i < 2; i++ {
+		out, err := interceptAfter(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var env envelope
+		_ = json.Unmarshal(out, &env)
+		var resp pluginapi.RequestInterceptResponse
+		_ = json.Unmarshal(env.Result, &resp)
+		if !resp.Terminate || resp.StatusCode != http.StatusServiceUnavailable {
+			t.Fatalf("capacity response = %#v", resp)
+		}
+		state.mu.Lock()
+		uncertain := state.uncertain
+		state.mu.Unlock()
+		if uncertain {
+			t.Fatal("typed capacity rejection poisoned authority")
+		}
+	}
+	a.mu.Lock()
+	a.full = false
+	a.mu.Unlock()
+	if err := base.Release(context.Background(), hold); err != nil {
+		t.Fatal(err)
+	}
+	out, err := interceptAfter(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var env envelope
+	_ = json.Unmarshal(out, &env)
+	var resp pluginapi.RequestInterceptResponse
+	_ = json.Unmarshal(env.Result, &resp)
+	if resp.Terminate {
+		t.Fatalf("admission did not recover after capacity release: %#v", resp)
+	}
+}
+
+func TestEmptyRequestIDIsRejectedWithoutLease(t *testing.T) {
+	resetTestState()
+	raw, _ := json.Marshal(pluginapi.RequestInterceptRequest{AuthID: "acct"})
+	out, err := interceptAfter(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var env envelope
+	_ = json.Unmarshal(out, &env)
+	var resp pluginapi.RequestInterceptResponse
+	_ = json.Unmarshal(env.Result, &resp)
+	if !resp.Terminate || resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("empty request id response = %#v", resp)
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if len(state.leases) != 0 || len(state.requests) != 0 {
+		t.Fatalf("empty request id created state: leases=%d requests=%d", len(state.leases), len(state.requests))
+	}
+}
+
+func TestAuthIDWhitespaceAliasIsStable(t *testing.T) {
+	resetTestState()
+	first, _ := json.Marshal(pluginapi.RequestInterceptRequest{RequestID: "alias", AuthID: " acct "})
+	if _, err := interceptAfter(first); err != nil {
+		t.Fatal(err)
+	}
+	second, _ := json.Marshal(pluginapi.RequestInterceptRequest{RequestID: "alias", AuthID: "acct"})
+	if _, err := interceptAfter(second); err != nil {
+		t.Fatal(err)
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if got := state.bound["alias"]; got != "acct" {
+		t.Fatalf("canonical bound auth = %q", got)
+	}
+}
+
+func TestRenewalFailureFencesUntilCompletion(t *testing.T) {
+	resetTestState()
+	base := &countingAuthority{localAuthority: newLocalAuthority()}
+	a := &renewalFailureAuthority{countingAuthority: base}
+	state.mu.Lock()
+	state.authority = a
+	state.mu.Unlock()
+	raw, _ := json.Marshal(pluginapi.RequestInterceptRequest{RequestID: "fenced", AuthID: "acct"})
+	if _, err := interceptAfter(raw); err != nil {
+		t.Fatal(err)
+	}
+	state.mu.Lock()
+	rs := state.requests["fenced"]
+	state.mu.Unlock()
+	startHeartbeatWithInterval(rs, a, rs.lease, time.Millisecond)
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		rs.mu.Lock()
+		fenced := rs.fenced
+		rs.mu.Unlock()
+		if fenced {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	rs.mu.Lock()
+	fenced := rs.fenced
+	rs.mu.Unlock()
+	if !fenced {
+		t.Fatal("renewal failure did not fence request")
+	}
+	state.mu.Lock()
+	uncertain, leaseCount := state.uncertain, len(state.leases)
+	if !uncertain || leaseCount != 1 {
+		state.mu.Unlock()
+		t.Fatalf("fenced state uncertain=%v leases=%d", uncertain, leaseCount)
+	}
+	state.mu.Unlock()
+	completion, _ := json.Marshal(pluginapi.RequestCompletion{RequestID: "fenced"})
+	if _, err := complete(completion); err != nil {
+		t.Fatal(err)
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if len(state.leases) != 0 {
+		t.Fatalf("lease retained after fenced completion: %d", len(state.leases))
+	}
+}
+
+type deadlineAuthority struct {
+	deadlineSeen bool
+}
+
+func (a *deadlineAuthority) Snapshot(ctx context.Context, _ string, _, _ int) (Usage, error) {
+	_, a.deadlineSeen = ctx.Deadline()
+	return Usage{}, ErrAuthorityUnavailable
+}
+func (a *deadlineAuthority) Acquire(context.Context, string, int, int, requestClass) (Lease, error) {
+	return Lease{}, ErrAuthorityUnavailable
+}
+func (a *deadlineAuthority) Release(ctx context.Context, _ Lease) error {
+	_, a.deadlineSeen = ctx.Deadline()
+	return ErrAuthorityUnavailable
+}
+func (a *deadlineAuthority) Renew(ctx context.Context, _ Lease) error {
+	_, a.deadlineSeen = ctx.Deadline()
+	return ErrAuthorityUnavailable
+}
+
+func TestSchedulerAuthorityCallHasDeadline(t *testing.T) {
+	resetTestState()
+	a := &deadlineAuthority{}
+	state.mu.Lock()
+	state.authority = a
+	state.mu.Unlock()
+	raw, _ := json.Marshal(pluginapi.SchedulerPickRequest{Candidates: []pluginapi.SchedulerAuthCandidate{{ID: "acct"}}})
+	if _, err := schedulerPick(raw); err == nil {
+		t.Fatal("scheduler unexpectedly admitted with unavailable authority")
+	}
+	if !a.deadlineSeen {
+		t.Fatal("scheduler authority call had no deadline")
+	}
+}
+
+func TestReconfigureDoesNotClearUncertaintyWithTrackedLease(t *testing.T) {
+	resetTestState()
+	raw, _ := json.Marshal(pluginapi.RequestInterceptRequest{RequestID: "uncertain", AuthID: "acct"})
+	if _, err := interceptAfter(raw); err != nil {
+		t.Fatal(err)
+	}
+	markAuthorityUncertain()
+	config, _ := json.Marshal(lifecycleRequest{SchemaVersion: 4, ConfigYAML: []byte("max_concurrency: 2\nwait_timeout: 1ms\nauthority: local\n")})
+	if err := configure(config); err != nil {
+		t.Fatal(err)
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if !state.uncertain {
+		t.Fatal("reconfigure cleared uncertainty while lease remained tracked")
+	}
+}
+
+func TestReconfigureShutdownAndLateCallbacksRaceSafely(t *testing.T) {
+	resetTestState()
+	raw, _ := json.Marshal(pluginapi.RequestInterceptRequest{RequestID: "race", AuthID: "acct"})
+	config, _ := json.Marshal(lifecycleRequest{SchemaVersion: 4, ConfigYAML: []byte("max_concurrency: 2\nwait_timeout: 1ms\nauthority: local\n")})
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(3)
+		go func() {
+			defer wg.Done()
+			_, _ = interceptAfter(raw)
+		}()
+		go func() {
+			defer wg.Done()
+			_, _ = complete([]byte(`{"request_id":"race"}`))
+		}()
+		go func() {
+			defer wg.Done()
+			_ = configure(config)
+		}()
+	}
+	shutdownDone := make(chan struct{})
+	go func() {
+		cliproxyPluginShutdown()
+		close(shutdownDone)
+	}()
+	wg.Wait()
+	<-shutdownDone
 }
 
 func TestDefaultReservationFormula(t *testing.T) {

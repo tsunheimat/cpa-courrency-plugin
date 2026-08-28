@@ -34,6 +34,11 @@ import (
 
 const pluginID = "cpa-account-concurrency"
 
+// authorityCallTimeout bounds release/renew/snapshot calls that are not
+// already covered by the request admission wait timeout.  A lost authority
+// must never leave a callback blocked forever.
+const authorityCallTimeout = 2 * time.Second
+
 type envelope struct {
 	OK     bool            `json:"ok"`
 	Result json.RawMessage `json:"result,omitempty"`
@@ -86,11 +91,13 @@ type pluginState struct {
 }
 
 type requestLifecycle struct {
-	mu       sync.Mutex
-	terminal bool
-	lease    Lease
-	bound    string
-	stopBeat chan struct{}
+	mu        sync.Mutex
+	terminal  bool
+	fenced    bool // lease renewal failed; do not admit another request
+	completed bool
+	lease     Lease
+	bound     string
+	stopBeat  chan struct{}
 }
 
 var state = pluginState{cfg: defaultConfig(), authority: newLocalAuthority(), leases: make(map[string]Lease), bound: make(map[string]string), requests: make(map[string]*requestLifecycle)}
@@ -170,6 +177,7 @@ func cliproxyPluginShutdown() {
 	for _, rs := range requests {
 		rs.mu.Lock()
 		rs.terminal = true
+		rs.completed = true
 		if rs.stopBeat != nil {
 			close(rs.stopBeat)
 			rs.stopBeat = nil
@@ -178,7 +186,9 @@ func cliproxyPluginShutdown() {
 	}
 	for _, lease := range leases {
 		if authority != nil {
-			_ = authority.Release(context.Background(), lease)
+			ctx, cancel := boundedAuthorityContext()
+			_ = authority.Release(ctx, lease)
+			cancel()
 		}
 	}
 }
@@ -253,7 +263,12 @@ func configure(raw []byte) error {
 	}
 	state.mu.Lock()
 	state.stopping = false
-	state.uncertain = false
+	// Do not clear an uncertainty while leases remain.  In particular, a
+	// renewal failure may have left a running request without a fenced lease;
+	// admitting new work before that request completes would permit oversell.
+	if len(state.leases) == 0 {
+		state.uncertain = false
+	}
 	if len(state.leases) > 0 && state.cfg.Authority != "" && state.cfg.Authority != cfg.Authority {
 		state.mu.Unlock()
 		return fmt.Errorf("cannot change concurrency authority while requests are in flight")
@@ -301,9 +316,14 @@ func schedulerPick(raw []byte) ([]byte, error) {
 		return nil, &AdmissionError{Code: "account_concurrency_authority_unavailable", HTTPStatus: http.StatusServiceUnavailable, RetryAfter: defaultRetryAfter, Message: "concurrency authority unavailable", Authority: true}
 	}
 	ids := make([]string, 0, len(req.Candidates))
+	seen := make(map[string]struct{}, len(req.Candidates))
 	for _, c := range req.Candidates {
-		if strings.TrimSpace(c.ID) != "" {
-			ids = append(ids, c.ID)
+		if id := canonicalAuthID(c.ID); id != "" {
+			if _, ok := seen[id]; ok {
+				continue
+			}
+			seen[id] = struct{}{}
+			ids = append(ids, id)
 		}
 	}
 	if len(ids) == 0 {
@@ -313,7 +333,9 @@ func schedulerPick(raw []byte) ([]byte, error) {
 	if strict && hint != "" {
 		for _, id := range ids {
 			if id == hint {
-				u, err := authority.Snapshot(context.Background(), accountKey("cpa", id), cfg.MaxConcurrency, cfg.WarmReservedSlots)
+				ctx, cancel := boundedAuthorityContext()
+				u, err := authority.Snapshot(ctx, accountKey("cpa", id), cfg.MaxConcurrency, cfg.WarmReservedSlots)
+				cancel()
 				if err != nil {
 					return nil, authorityError(err)
 				}
@@ -327,7 +349,9 @@ func schedulerPick(raw []byte) ([]byte, error) {
 	if warm {
 		ids = preferHint(ids, hint)
 	}
-	selected, err := chooseCandidate(context.Background(), authority, ids, cfg.MaxConcurrency, cfg.WarmReservedSlots, func() requestClass {
+	ctx, cancel := boundedAuthorityContext()
+	defer cancel()
+	selected, err := chooseCandidate(ctx, authority, ids, cfg.MaxConcurrency, cfg.WarmReservedSlots, func() requestClass {
 		if warm {
 			return classWarm
 		}
@@ -364,6 +388,11 @@ func interceptAfter(raw []byte) ([]byte, error) {
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
 	}
+	req.RequestID = strings.TrimSpace(req.RequestID)
+	req.AuthID = canonicalAuthID(req.AuthID)
+	if req.RequestID == "" {
+		return admissionResponse(&AdmissionError{Code: "invalid_request_id", HTTPStatus: http.StatusBadRequest, Message: "request_id is required"})
+	}
 	state.gate.RLock()
 	defer state.gate.RUnlock()
 	state.mu.Lock()
@@ -398,6 +427,9 @@ func interceptAfter(raw []byte) ([]byte, error) {
 	}
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
+	if rs.fenced {
+		return admissionResponse(&AdmissionError{Code: "account_concurrency_authority_unavailable", HTTPStatus: http.StatusServiceUnavailable, RetryAfter: defaultRetryAfter, Message: "concurrency authority unavailable", Authority: true})
+	}
 	if rs.terminal {
 		return okEnvelope(pluginapi.RequestInterceptResponse{Headers: req.Headers, Body: req.Body})
 	}
@@ -406,7 +438,10 @@ func interceptAfter(raw []byte) ([]byte, error) {
 		return okEnvelope(pluginapi.RequestInterceptResponse{Headers: req.Headers, Body: req.Body})
 	}
 	if old.Token != "" {
-		if errRelease := authority.Release(context.Background(), old); errRelease != nil {
+		ctxRelease, cancelRelease := boundedAuthorityContext()
+		errRelease := authority.Release(ctxRelease, old)
+		cancelRelease()
+		if errRelease != nil {
 			markAuthorityUncertain()
 			return admissionResponse(&AdmissionError{Code: "account_concurrency_authority_unavailable", HTTPStatus: http.StatusServiceUnavailable, RetryAfter: defaultRetryAfter, Message: "concurrency authority unavailable", Authority: true})
 		}
@@ -420,7 +455,9 @@ func interceptAfter(raw []byte) ([]byte, error) {
 	}
 	lease, err := authority.Acquire(ctx, key, cfg.MaxConcurrency, cfg.WarmReservedSlots, class)
 	if err != nil {
-		if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+		var capacity *AdmissionError
+		isCapacity := errors.As(err, &capacity) && capacity.Code == "account_concurrency_limit"
+		if !isCapacity && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
 			markAuthorityUncertain()
 		}
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
@@ -446,6 +483,10 @@ func complete(raw []byte) ([]byte, error) {
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
 	}
+	req.RequestID = strings.TrimSpace(req.RequestID)
+	if req.RequestID == "" {
+		return okEnvelope(struct{}{})
+	}
 	state.gate.RLock()
 	defer state.gate.RUnlock()
 	state.mu.Lock()
@@ -456,11 +497,12 @@ func complete(raw []byte) ([]byte, error) {
 	}
 	state.mu.Unlock()
 	rs.mu.Lock()
-	if rs.terminal {
+	if rs.completed {
 		rs.mu.Unlock()
 		return okEnvelope(struct{}{})
 	}
 	rs.terminal = true
+	rs.completed = true
 	lease := rs.lease
 	ok := lease.Token != ""
 	stopHeartbeat(rs)
@@ -473,7 +515,10 @@ func complete(raw []byte) ([]byte, error) {
 	state.mu.Unlock()
 	rs.mu.Unlock()
 	if ok && authority != nil {
-		if err := authority.Release(context.Background(), lease); err != nil {
+		ctx, cancel := boundedAuthorityContext()
+		err := authority.Release(ctx, lease)
+		cancel()
+		if err != nil {
 			markAuthorityUncertain()
 		}
 	}
@@ -487,6 +532,10 @@ func markAuthorityUncertain() {
 }
 
 func startHeartbeat(rs *requestLifecycle, authority Authority, lease Lease) {
+	startHeartbeatWithInterval(rs, authority, lease, leaseRenewInterval)
+}
+
+func startHeartbeatWithInterval(rs *requestLifecycle, authority Authority, lease Lease, interval time.Duration) {
 	if authority == nil || lease.Token == "" {
 		return
 	}
@@ -494,7 +543,10 @@ func startHeartbeat(rs *requestLifecycle, authority Authority, lease Lease) {
 	stop := make(chan struct{})
 	rs.stopBeat = stop
 	go func() {
-		t := time.NewTicker(leaseRenewInterval)
+		if interval <= 0 {
+			interval = leaseRenewInterval
+		}
+		t := time.NewTicker(interval)
 		defer t.Stop()
 		for {
 			select {
@@ -504,10 +556,16 @@ func startHeartbeat(rs *requestLifecycle, authority Authority, lease Lease) {
 					rs.mu.Unlock()
 					return
 				}
-				if err := authority.Renew(context.Background(), lease); err != nil {
+				ctx, cancel := boundedAuthorityContext()
+				err := authority.Renew(ctx, lease)
+				cancel()
+				if err != nil {
+					rs.terminal = true
+					rs.fenced = true
 					rs.mu.Unlock()
-					// Renewal uncertainty is fail-closed for future admissions; the
-					// current request still owns its local lifecycle until completion.
+					// Renewal uncertainty fences this request and fails closed for all
+					// future admissions. Reconfigure cannot clear uncertainty while the
+					// lease remains in state.leases.
 					markAuthorityUncertain()
 					return
 				}
@@ -527,18 +585,37 @@ func stopHeartbeat(rs *requestLifecycle) {
 }
 
 func admissionResponse(err *AdmissionError) ([]byte, error) {
-	body, _ := json.Marshal(map[string]any{"error": map[string]any{"type": err.Code, "code": err.Code, "message": err.Message, "retryable": true}})
-	headers := http.Header{"Content-Type": []string{"application/json"}, "Retry-After": []string{strconv.Itoa(err.RetryAfter)}}
-	return okEnvelope(pluginapi.RequestInterceptResponse{Terminate: true, StatusCode: http.StatusServiceUnavailable, ResponseHeaders: headers, ResponseBody: body})
+	if err == nil {
+		err = &AdmissionError{Code: "account_concurrency_authority_unavailable", HTTPStatus: http.StatusServiceUnavailable, RetryAfter: defaultRetryAfter, Message: "concurrency authority unavailable", Authority: true}
+	}
+	body, _ := json.Marshal(map[string]any{"error": map[string]any{"type": err.Code, "code": err.Code, "message": err.Message, "retryable": err.Retryable()}})
+	status := err.HTTPStatus
+	if status == 0 {
+		status = http.StatusServiceUnavailable
+	}
+	headers := http.Header{"Content-Type": []string{"application/json"}}
+	if err.RetryAfter > 0 {
+		headers.Set("Retry-After", strconv.Itoa(err.RetryAfter))
+	}
+	return okEnvelope(pluginapi.RequestInterceptResponse{Terminate: true, StatusCode: status, ResponseHeaders: headers, ResponseBody: body})
 }
+
+func boundedAuthorityContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), authorityCallTimeout)
+}
+
+// Account IDs are canonicalized by trimming surrounding whitespace only.
+// Case and all interior characters remain significant; distinct IDs therefore
+// cannot silently alias except for this documented whitespace normalization.
+func canonicalAuthID(id string) string { return strings.TrimSpace(id) }
 
 func affinityHint(metadata map[string]any) (hint string, strict, warm bool) {
 	if metadata == nil {
 		return
 	}
 	for _, key := range []string{"pinned_auth_id", "selected_auth_id", "session_auth_id", "affinity_auth_id", "cache_auth_id"} {
-		if v, ok := metadata[key].(string); ok && strings.TrimSpace(v) != "" {
-			hint = strings.TrimSpace(v)
+		if v, ok := metadata[key].(string); ok && canonicalAuthID(v) != "" {
+			hint = canonicalAuthID(v)
 			strict = key != "cache_auth_id"
 			warm = strict
 			break

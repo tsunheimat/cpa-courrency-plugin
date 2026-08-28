@@ -2,8 +2,11 @@
 
 This plugin adds sub2api-like protection for CPA Pro accounts. It is a C ABI
 dynamic-library plugin and uses the CPA request-interceptor and request-lifecycle
-hooks. The protected resource is the stable CPA auth ID; IDs are hashed before
-they are used as authority keys and are never returned in errors or logs.
+hooks. The protected resource is the stable CPA auth ID. IDs are canonicalized
+by trimming surrounding whitespace (case and interior characters remain
+significant), then hashed before they are used as authority keys and never
+returned in errors or logs. Duplicate scheduler candidates collapse after
+this canonicalization.
 
 ## Configuration
 
@@ -46,7 +49,9 @@ provider. Redis leases carry a bounded 30-second expiry and are renewed by a
 10-second heartbeat while the request is live. Acquire, expiry reclamation,
 renewal, and release are atomic; release is idempotent. If renewal or any
 authority operation is uncertain, new admissions fail closed until the plugin
-is reconfigured, while the in-flight request remains tracked for cleanup.
+is reconfigured. A failed renewal fences that request locally; uncertainty is
+not cleared by reconfigure while its lease is still tracked, preventing a
+live, unrenewed request from being oversold to another lease.
 
 ## Lifecycle and failover
 
