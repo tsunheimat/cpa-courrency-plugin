@@ -308,6 +308,8 @@ func (a *redisAuthority) Snapshot(ctx context.Context, account string, limit, re
 	if a == nil || a.client == nil {
 		return Usage{}, ErrAuthorityUnavailable
 	}
+	ctx, cancel := ensureAuthorityContext(ctx)
+	defer cancel()
 	result, err := a.client.Eval(ctx, redisSnapshotScript, []string{a.key(account)}, time.Now().UnixMilli(), leaseTTL.Milliseconds())
 	if err != nil {
 		return Usage{}, fmt.Errorf("%w: %v", ErrAuthorityUnavailable, err)
@@ -325,6 +327,8 @@ func (a *redisAuthority) Acquire(ctx context.Context, account string, limit, res
 	if a == nil || a.client == nil {
 		return Lease{}, ErrAuthorityUnavailable
 	}
+	ctx, cancel := ensureAuthorityContext(ctx)
+	defer cancel()
 	token := fmt.Sprintf("%x", sha256.Sum256([]byte(account+":"+strconv.FormatInt(time.Now().UnixNano(), 10))))
 	result, err := a.client.Eval(ctx, redisAcquireScript, []string{a.key(account)}, limit, reserved, int(class), token, time.Now().UnixMilli(), leaseTTL.Milliseconds())
 	if err != nil {
@@ -342,6 +346,8 @@ func (a *redisAuthority) Release(ctx context.Context, lease Lease) error {
 	if a == nil || a.client == nil {
 		return ErrAuthorityUnavailable
 	}
+	ctx, cancel := ensureAuthorityContext(ctx)
+	defer cancel()
 	if _, err := a.client.Eval(ctx, redisReleaseScript, []string{a.key(lease.Key)}, lease.Token, int(lease.Class), leaseTTL.Milliseconds()); err != nil {
 		return fmt.Errorf("%w: %v", ErrAuthorityUnavailable, err)
 	}
@@ -352,6 +358,8 @@ func (a *redisAuthority) Renew(ctx context.Context, lease Lease) error {
 	if a == nil || a.client == nil {
 		return ErrAuthorityUnavailable
 	}
+	ctx, cancel := ensureAuthorityContext(ctx)
+	defer cancel()
 	now := time.Now().UnixMilli()
 	result, err := a.client.Eval(ctx, redisRenewScript, []string{a.key(lease.Key)}, lease.Token, now, leaseTTL.Milliseconds())
 	if err != nil {
@@ -361,6 +369,16 @@ func (a *redisAuthority) Renew(ctx context.Context, lease Lease) error {
 		return ErrAuthorityUnavailable
 	}
 	return nil
+}
+
+func ensureAuthorityContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		return context.WithTimeout(context.Background(), authorityCallTimeout)
+	}
+	if _, ok := ctx.Deadline(); ok {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, authorityCallTimeout)
 }
 
 func toInt(v any) (int, bool) {
