@@ -56,6 +56,10 @@ type lifecycleRequest struct {
 	ConfigYAML    []byte `json:"config_yaml"`
 	SchemaVersion uint32 `json:"schema_version"`
 }
+
+type quiesceRequest struct {
+	DeadlineUnixNano int64 `json:"deadline_unix_nano,omitempty"`
+}
 type registration struct {
 	SchemaVersion uint32                   `json:"schema_version"`
 	Metadata      pluginapi.Metadata       `json:"metadata"`
@@ -212,6 +216,11 @@ func handleMethod(method string, raw []byte) ([]byte, error) {
 			return nil, err
 		}
 		return okEnvelope(pluginRegistration())
+	case pluginabi.MethodPluginQuiesce:
+		if err := quiesce(raw); err != nil {
+			return nil, err
+		}
+		return okEnvelope(struct{}{})
 	case pluginabi.MethodSchedulerPick:
 		return schedulerPick(raw)
 	case pluginabi.MethodRequestInterceptBefore:
@@ -222,6 +231,45 @@ func handleMethod(method string, raw []byte) ([]byte, error) {
 		return complete(raw)
 	default:
 		return errorEnvelope("unknown_method", "unknown method: "+method), nil
+	}
+}
+
+// quiesce fences new admission on this instance and waits for every lease it
+// owns to complete. It intentionally does not take state.gate: completion
+// callbacks must remain able to drain existing leases while new callbacks see
+// state.stopping and fail closed. A timeout leaves the instance fenced and
+// authoritative; the host must not replace it.
+func quiesce(raw []byte) error {
+	deadline := time.Now().Add(authorityCallTimeout)
+	if len(raw) > 0 {
+		var req quiesceRequest
+		if err := json.Unmarshal(raw, &req); err != nil {
+			return err
+		}
+		if req.DeadlineUnixNano > 0 {
+			deadline = time.Unix(0, req.DeadlineUnixNano)
+		}
+	}
+	state.mu.Lock()
+	state.stopping = true
+	if len(state.leases) > 0 {
+		state.reloadFence = true
+	}
+	state.mu.Unlock()
+	for {
+		state.mu.Lock()
+		remaining := len(state.leases)
+		state.mu.Unlock()
+		if remaining == 0 {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			state.mu.Lock()
+			state.reloadFence = true
+			state.mu.Unlock()
+			return context.DeadlineExceeded
+		}
+		time.Sleep(defaultPollInterval)
 	}
 }
 
@@ -325,12 +373,12 @@ func schedulerPick(raw []byte) ([]byte, error) {
 		return nil, err
 	}
 	state.mu.Lock()
-	cfg, authority, uncertain := state.cfg, state.authority, state.uncertain
+	cfg, authority, stopping, uncertain := state.cfg, state.authority, state.stopping, state.uncertain
 	state.mu.Unlock()
 	if !cfg.Enabled {
 		return okEnvelope(pluginapi.SchedulerPickResponse{Handled: false})
 	}
-	if authority == nil || uncertain {
+	if authority == nil || stopping || uncertain {
 		return nil, &AdmissionError{Code: "account_concurrency_authority_unavailable", HTTPStatus: http.StatusServiceUnavailable, RetryAfter: defaultRetryAfter, Message: "concurrency authority unavailable", Authority: true}
 	}
 	ids := make([]string, 0, len(req.Candidates))
@@ -530,6 +578,23 @@ func complete(raw []byte) ([]byte, error) {
 	lease := rs.lease
 	ok := lease.Token != ""
 	stopHeartbeat(rs)
+	state.mu.Lock()
+	authority := state.authority
+	state.mu.Unlock()
+	// Keep the lease visible to quiesce until its authority release succeeds.
+	// Otherwise quiesce could report a safe drain while a slow or failed Redis
+	// release still leaves the retiring instance authoritative.
+	if ok && authority != nil {
+		ctx, cancel := boundedAuthorityContext()
+		err := authority.Release(ctx, lease)
+		cancel()
+		if err != nil {
+			markAuthorityUncertain()
+			rs.fenced = true
+			rs.mu.Unlock()
+			return okEnvelope(struct{}{})
+		}
+	}
 	rs.lease = Lease{}
 	rs.bound = ""
 	state.mu.Lock()
@@ -539,17 +604,8 @@ func complete(raw []byte) ([]byte, error) {
 		state.uncertain = false
 		state.reloadFence = false
 	}
-	authority := state.authority
 	state.mu.Unlock()
 	rs.mu.Unlock()
-	if ok && authority != nil {
-		ctx, cancel := boundedAuthorityContext()
-		err := authority.Release(ctx, lease)
-		cancel()
-		if err != nil {
-			markAuthorityUncertain()
-		}
-	}
 	return okEnvelope(struct{}{})
 }
 

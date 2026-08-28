@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
@@ -80,6 +81,77 @@ func TestHotReloadFailsClosedUntilInflightLeaseCompletes(t *testing.T) {
 	}
 	if _, err := interceptAfter(second); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestPluginQuiesceDrainsInflightLeaseAndFencesAdmission(t *testing.T) {
+	resetTestState()
+	raw, _ := json.Marshal(pluginapi.RequestInterceptRequest{RequestID: "drain", AuthID: "acct"})
+	if _, err := interceptAfter(raw); err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan error, 1)
+	go func() {
+		deadline := time.Now().Add(500 * time.Millisecond).UnixNano()
+		payload, _ := json.Marshal(quiesceRequest{DeadlineUnixNano: deadline})
+		_, err := handleMethod(pluginabi.MethodPluginQuiesce, payload)
+		result <- err
+	}()
+	// Quiescing must stop new work while allowing the old request to complete.
+	time.Sleep(10 * time.Millisecond)
+	newRaw, _ := json.Marshal(pluginapi.RequestInterceptRequest{RequestID: "new", AuthID: "acct"})
+	out, err := interceptAfter(newRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var env envelope
+	_ = json.Unmarshal(out, &env)
+	var rejected pluginapi.RequestInterceptResponse
+	_ = json.Unmarshal(env.Result, &rejected)
+	if !rejected.Terminate {
+		t.Fatal("admission succeeded while plugin was quiescing")
+	}
+	completion, _ := json.Marshal(pluginapi.RequestCompletion{RequestID: "drain"})
+	if _, err := complete(completion); err != nil {
+		t.Fatal(err)
+	}
+	state.mu.Lock()
+	remaining := len(state.leases)
+	state.mu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("leases after completion = %d", remaining)
+	}
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("quiesce error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("quiesce did not complete after lease drain")
+	}
+}
+
+func TestPluginQuiesceTimeoutLeavesAuthorityFenced(t *testing.T) {
+	resetTestState()
+	raw, _ := json.Marshal(pluginapi.RequestInterceptRequest{RequestID: "stuck", AuthID: "acct"})
+	if _, err := interceptAfter(raw); err != nil {
+		t.Fatal(err)
+	}
+	payload, _ := json.Marshal(quiesceRequest{DeadlineUnixNano: time.Now().Add(10 * time.Millisecond).UnixNano()})
+	if _, err := handleMethod(pluginabi.MethodPluginQuiesce, payload); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("quiesce error = %v, want deadline exceeded", err)
+	}
+	newRaw, _ := json.Marshal(pluginapi.RequestInterceptRequest{RequestID: "after-timeout", AuthID: "acct"})
+	out, err := interceptAfter(newRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var env envelope
+	_ = json.Unmarshal(out, &env)
+	var rejected pluginapi.RequestInterceptResponse
+	_ = json.Unmarshal(env.Result, &rejected)
+	if !rejected.Terminate {
+		t.Fatal("admission succeeded after quiesce timeout")
 	}
 }
 
