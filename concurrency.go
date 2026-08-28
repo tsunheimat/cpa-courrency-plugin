@@ -375,8 +375,11 @@ func ensureAuthorityContext(ctx context.Context) (context.Context, context.Cance
 	if ctx == nil {
 		return context.WithTimeout(context.Background(), authorityCallTimeout)
 	}
-	if _, ok := ctx.Deadline(); ok {
-		return ctx, func() {}
+	if deadline, ok := ctx.Deadline(); ok {
+		if time.Until(deadline) <= authorityCallTimeout {
+			return ctx, func() {}
+		}
+		return context.WithTimeout(ctx, authorityCallTimeout)
 	}
 	return context.WithTimeout(ctx, authorityCallTimeout)
 }
