@@ -129,6 +129,46 @@ func TestSelectedAccountBindingTransferAndCompletionRelease(t *testing.T) {
 	}
 }
 
+func TestFailedFailoverDoesNotLeaveStaleLeaseBinding(t *testing.T) {
+	resetTestState()
+	raw, _ := json.Marshal(pluginapi.RequestInterceptRequest{RequestID: "r2", AuthID: "a"})
+	if _, err := interceptAfter(raw); err != nil {
+		t.Fatal(err)
+	}
+	// Fill account b so the failover attempt is rejected.
+	state.mu.Lock()
+	authority := state.authority
+	state.mu.Unlock()
+	for i := 0; i < 2; i++ {
+		if _, err := authority.Acquire(context.Background(), accountKey("cpa", "b"), 2, 1, classWarm); err != nil {
+			t.Fatal(err)
+		}
+	}
+	raw, _ = json.Marshal(pluginapi.RequestInterceptRequest{RequestID: "r2", AuthID: "b"})
+	out, err := interceptAfter(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var env envelope
+	_ = json.Unmarshal(out, &env)
+	var rejected pluginapi.RequestInterceptResponse
+	_ = json.Unmarshal(env.Result, &rejected)
+	if !rejected.Terminate {
+		t.Fatal("full failover account was not rejected")
+	}
+	raw, _ = json.Marshal(pluginapi.RequestInterceptRequest{RequestID: "r2", AuthID: "a"})
+	out, err = interceptAfter(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = json.Unmarshal(out, &env)
+	var resumed pluginapi.RequestInterceptResponse
+	_ = json.Unmarshal(env.Result, &resumed)
+	if resumed.Terminate {
+		t.Fatal("retry on original account retained stale released binding")
+	}
+}
+
 func TestAdmissionResponseIsMachineReadable503(t *testing.T) {
 	raw, err := admissionResponse(&AdmissionError{Code: "account_concurrency_limit", HTTPStatus: http.StatusServiceUnavailable, RetryAfter: 1, Message: "account concurrency limit reached"})
 	if err != nil {
