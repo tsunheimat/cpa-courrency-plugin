@@ -759,8 +759,57 @@ func (fencedRedis) Eval(_ context.Context, script string, _ []string, _ ...any) 
 
 func TestRedisAcquireAfterExpiryFenceFailsClosedForAnotherInstance(t *testing.T) {
 	a := newRedisAuthority(fencedRedis{}, "cpa:test")
-	if _, err := a.Acquire(context.Background(), "acct", 1, 0, classWarm); !errors.Is(err, ErrAuthorityUnavailable) {
+	lease, err := a.Acquire(context.Background(), "acct", 1, 0, classWarm)
+	if lease.Token != "" {
+		t.Fatalf("fenced acquire returned lease %#v", lease)
+	}
+	if !errors.Is(err, ErrAuthorityUnavailable) {
 		t.Fatalf("fenced acquire error = %v, want authority unavailable", err)
+	}
+}
+
+func TestRedisAcquireFenceProducesTypedAuthorityUnavailable(t *testing.T) {
+	resetTestState()
+	state.mu.Lock()
+	state.authority = newRedisAuthority(fencedRedis{}, "cpa:test")
+	state.mu.Unlock()
+
+	raw, _ := json.Marshal(pluginapi.RequestInterceptRequest{RequestID: "fenced", AuthID: "acct"})
+	out, err := interceptAfter(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var env envelope
+	if err := json.Unmarshal(out, &env); err != nil {
+		t.Fatal(err)
+	}
+	var resp pluginapi.RequestInterceptResponse
+	if err := json.Unmarshal(env.Result, &resp); err != nil {
+		t.Fatal(err)
+	}
+	if !resp.Terminate || resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("fenced response = %#v", resp)
+	}
+	var body map[string]map[string]any
+	if err := json.Unmarshal(resp.ResponseBody, &body); err != nil {
+		t.Fatal(err)
+	}
+	if got := body["error"]["type"]; got != "account_concurrency_authority_unavailable" {
+		t.Fatalf("fenced error type = %v", got)
+	}
+	if got := body["error"]["code"]; got != "account_concurrency_authority_unavailable" {
+		t.Fatalf("fenced error code = %v", got)
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if len(state.leases) != 0 {
+		t.Fatalf("fenced admission created leases: %#v", state.leases)
+	}
+	if got := state.requests["fenced"].lease; got.Token != "" {
+		t.Fatalf("fenced request retained lease %#v", got)
+	}
+	if !state.uncertain {
+		t.Fatal("fenced authority failure did not preserve fail-closed uncertainty")
 	}
 }
 

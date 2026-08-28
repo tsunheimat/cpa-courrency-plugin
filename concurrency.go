@@ -339,14 +339,22 @@ func (a *redisAuthority) Acquire(ctx context.Context, account string, limit, res
 	if err != nil {
 		return Lease{}, fmt.Errorf("%w: %v", ErrAuthorityUnavailable, err)
 	}
-	if n, ok := toInt(result); !ok {
+	n, ok := toInt(result)
+	if !ok {
 		return Lease{}, ErrAuthorityUnavailable
-	} else if n < 0 {
-		return Lease{}, ErrAuthorityUnavailable
-	} else if n == 0 {
-		return Lease{}, &AdmissionError{Code: "account_concurrency_limit", HTTPStatus: http.StatusServiceUnavailable, RetryAfter: defaultRetryAfter, Message: "account concurrency limit reached"}
 	}
-	return Lease{Token: token, Key: account, Class: class}, nil
+	switch n {
+	case 0:
+		return Lease{}, &AdmissionError{Code: "account_concurrency_limit", HTTPStatus: http.StatusServiceUnavailable, RetryAfter: defaultRetryAfter, Message: "account concurrency limit reached"}
+	case 1:
+		return Lease{Token: token, Key: account, Class: class}, nil
+	default:
+		// redisAcquireScript reserves negative values for fail-closed
+		// authority state (currently -1 for a fenced account). Treat every
+		// unexpected result as unavailable too; only the explicit success
+		// sentinel may create a lease.
+		return Lease{}, ErrAuthorityUnavailable
+	}
 }
 
 func (a *redisAuthority) Release(ctx context.Context, lease Lease) error {
