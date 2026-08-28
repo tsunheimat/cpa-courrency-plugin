@@ -36,7 +36,73 @@ func resetTestState() {
 	state.requests = make(map[string]*requestLifecycle)
 	state.stopping = false
 	state.uncertain = false
+	state.reloadFence = false
 	state.mu.Unlock()
+}
+
+func TestPluginRegistrationIncludesRequiredRepositoryMetadata(t *testing.T) {
+	reg := pluginRegistration()
+	if reg.Metadata.GitHubRepository == "" {
+		t.Fatal("plugin registration omitted GitHubRepository")
+	}
+	if reg.Metadata.Name != pluginID || !reg.Capabilities.Scheduler || !reg.Capabilities.RequestInterceptorEnforcesAdmission {
+		t.Fatalf("registration = %#v", reg)
+	}
+}
+
+func TestHotReloadFailsClosedUntilInflightLeaseCompletes(t *testing.T) {
+	resetTestState()
+	first, _ := json.Marshal(pluginapi.RequestInterceptRequest{RequestID: "reload", AuthID: "acct"})
+	if _, err := interceptAfter(first); err != nil {
+		t.Fatal(err)
+	}
+	cliproxyPluginShutdown()
+	config, _ := json.Marshal(lifecycleRequest{SchemaVersion: 4, ConfigYAML: []byte("authority: local\nmax_concurrency: 1\nwait_timeout: 1ms\n")})
+	if err := configure(config); err != nil {
+		t.Fatal(err)
+	}
+	second, _ := json.Marshal(pluginapi.RequestInterceptRequest{RequestID: "new", AuthID: "acct"})
+	out, err := interceptAfter(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var env envelope
+	_ = json.Unmarshal(out, &env)
+	var rejected pluginapi.RequestInterceptResponse
+	if env.OK {
+		_ = json.Unmarshal(env.Result, &rejected)
+	}
+	if !rejected.Terminate {
+		t.Fatal("reload admitted overlapping lease")
+	}
+	if _, err := complete([]byte(`{"request_id":"reload"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := interceptAfter(second); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRedisReconfigureSwapsMaterialClientConfigWhenIdle(t *testing.T) {
+	resetTestState()
+	first, _ := json.Marshal(lifecycleRequest{SchemaVersion: 4, ConfigYAML: []byte("authority: redis\nredis_addr: 127.0.0.1:6379\nredis_password: one\nredis_db: 1\nredis_prefix: first\n")})
+	if err := configure(first); err != nil {
+		t.Fatal(err)
+	}
+	second, _ := json.Marshal(lifecycleRequest{SchemaVersion: 4, ConfigYAML: []byte("authority: redis\nredis_addr: 127.0.0.1:6380\nredis_password: two\nredis_db: 2\nredis_prefix: second\n")})
+	if err := configure(second); err != nil {
+		t.Fatal(err)
+	}
+	state.mu.Lock()
+	a, ok := state.authority.(*redisAuthority)
+	state.mu.Unlock()
+	if !ok {
+		t.Fatalf("authority type = %T", state.authority)
+	}
+	client, ok := a.client.(redisNetClient)
+	if !ok || client.addr != "127.0.0.1:6380" || client.password != "two" || client.db != 2 || a.prefix != "second" {
+		t.Fatalf("redis authority = %#v client=%#v", a, a.client)
+	}
 }
 
 type countingAuthority struct {

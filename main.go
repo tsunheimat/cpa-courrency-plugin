@@ -50,6 +50,7 @@ type envelopeError struct {
 	Message    string `json:"message"`
 	Retryable  bool   `json:"retryable,omitempty"`
 	HTTPStatus int    `json:"http_status,omitempty"`
+	RetryAfter int    `json:"retry_after,omitempty"`
 }
 type lifecycleRequest struct {
 	ConfigYAML    []byte `json:"config_yaml"`
@@ -80,15 +81,16 @@ type pluginConfig struct {
 }
 
 type pluginState struct {
-	mu        sync.Mutex
-	gate      sync.RWMutex // serializes shutdown/reconfigure against callbacks
-	cfg       pluginConfig
-	authority Authority
-	leases    map[string]Lease
-	bound     map[string]string
-	requests  map[string]*requestLifecycle
-	stopping  bool
-	uncertain bool
+	mu          sync.Mutex
+	gate        sync.RWMutex // serializes shutdown/reconfigure against callbacks
+	cfg         pluginConfig
+	authority   Authority
+	leases      map[string]Lease
+	bound       map[string]string
+	requests    map[string]*requestLifecycle
+	stopping    bool
+	uncertain   bool
+	reloadFence bool
 }
 
 type requestLifecycle struct {
@@ -101,7 +103,8 @@ type requestLifecycle struct {
 	stopBeat  chan struct{}
 }
 
-var state = pluginState{cfg: defaultConfig(), authority: newLocalAuthority(), leases: make(map[string]Lease), bound: make(map[string]string), requests: make(map[string]*requestLifecycle)}
+var localAuthorityShared = newLocalAuthority()
+var state = pluginState{cfg: defaultConfig(), authority: localAuthorityShared, leases: make(map[string]Lease), bound: make(map[string]string), requests: make(map[string]*requestLifecycle)}
 
 func defaultConfig() pluginConfig {
 	return pluginConfig{Enabled: true, MaxConcurrency: defaultLimit, WarmReservedSlots: 0, WaitTimeout: defaultWait, Authority: "local", RedisPrefix: "cpa:concurrency"}
@@ -139,7 +142,7 @@ func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t,
 	if err != nil {
 		var admission *AdmissionError
 		if errors.As(err, &admission) {
-			writeResponse(response, typedErrorEnvelope(admission.Code, admission.Message, admission.Retryable(), admission.StatusCode()))
+			writeResponse(response, typedErrorEnvelope(admission.Code, admission.Message, admission.Retryable(), admission.StatusCode(), admission.RetryAfter))
 		} else {
 			writeResponse(response, errorEnvelope("plugin_error", err.Error()))
 		}
@@ -166,10 +169,11 @@ func cliproxyPluginShutdown() {
 		leases = append(leases, lease)
 	}
 	authority := state.authority
-	state.leases = make(map[string]Lease)
-	state.bound = make(map[string]string)
 	state.stopping = true
-	state.uncertain = false
+	if len(leases) > 0 {
+		state.uncertain = true
+		state.reloadFence = true
+	}
 	requests := make([]*requestLifecycle, 0, len(state.requests))
 	for _, rs := range state.requests {
 		requests = append(requests, rs)
@@ -177,8 +181,6 @@ func cliproxyPluginShutdown() {
 	state.mu.Unlock()
 	for _, rs := range requests {
 		rs.mu.Lock()
-		rs.terminal = true
-		rs.completed = true
 		if rs.stopBeat != nil {
 			close(rs.stopBeat)
 			rs.stopBeat = nil
@@ -191,6 +193,15 @@ func cliproxyPluginShutdown() {
 			_ = authority.Release(ctx, lease)
 			cancel()
 		}
+	}
+	// Authority release above is the single ownership transition. Keep request
+	// records so late completion callbacks can clear the reload fence, but do
+	// not ask the authority to release the same token a second time.
+	for _, rs := range requests {
+		rs.mu.Lock()
+		rs.lease = Lease{}
+		rs.bound = ""
+		rs.mu.Unlock()
 	}
 }
 
@@ -275,12 +286,18 @@ func configure(raw []byte) error {
 		return fmt.Errorf("cannot change concurrency authority while requests are in flight")
 	}
 	previousAuthority := state.cfg.Authority
+	materialRedisChange := previousAuthority == "redis" && cfg.Authority == "redis" &&
+		(state.cfg.RedisAddr != cfg.RedisAddr || state.cfg.RedisPassword != cfg.RedisPassword || state.cfg.RedisDB != cfg.RedisDB || state.cfg.RedisPrefix != cfg.RedisPrefix)
+	if materialRedisChange && len(state.leases) > 0 {
+		state.mu.Unlock()
+		return fmt.Errorf("cannot change Redis authority configuration while requests are in flight")
+	}
 	state.cfg = cfg
 	if cfg.Authority == "local" {
 		if previousAuthority != "local" || state.authority == nil {
-			state.authority = newLocalAuthority()
+			state.authority = localAuthorityShared
 		}
-	} else if previousAuthority != "redis" || state.authority == nil {
+	} else if previousAuthority != "redis" || state.authority == nil || materialRedisChange {
 		state.authority = newRedisAuthority(redisNetClient{addr: cfg.RedisAddr, password: cfg.RedisPassword, db: cfg.RedisDB}, cfg.RedisPrefix)
 	}
 	state.mu.Unlock()
@@ -288,7 +305,7 @@ func configure(raw []byte) error {
 }
 
 func pluginRegistration() registration {
-	return registration{SchemaVersion: pluginabi.SchemaVersion, Metadata: pluginapi.Metadata{Name: pluginID, Version: "0.1.0", Author: "CPA concurrency plugin", ConfigFields: []pluginapi.ConfigField{
+	return registration{SchemaVersion: pluginabi.SchemaVersion, Metadata: pluginapi.Metadata{Name: pluginID, Version: "0.1.0", Author: "CPA concurrency plugin", GitHubRepository: "https://github.com/router-for-me/CLIProxyAPI", ConfigFields: []pluginapi.ConfigField{
 		{Name: "max_concurrency", Type: pluginapi.ConfigFieldTypeInteger, Description: "Hard per-account in-flight limit."},
 		{Name: "warm_reserved_slots", Type: pluginapi.ConfigFieldTypeInteger, Description: "Reserved slots for verified warm/strict affinity."},
 		{Name: "wait_timeout", Type: pluginapi.ConfigFieldTypeString, Description: "Bounded admission wait (Go duration, for example 50ms)."},
@@ -518,6 +535,10 @@ func complete(raw []byte) ([]byte, error) {
 	state.mu.Lock()
 	delete(state.leases, req.RequestID)
 	delete(state.bound, req.RequestID)
+	if len(state.leases) == 0 && state.reloadFence {
+		state.uncertain = false
+		state.reloadFence = false
+	}
 	authority := state.authority
 	state.mu.Unlock()
 	rs.mu.Unlock()
@@ -698,8 +719,12 @@ func errorEnvelope(code, msg string) []byte {
 	return typedErrorEnvelope(code, msg, true, http.StatusServiceUnavailable)
 }
 
-func typedErrorEnvelope(code, msg string, retryable bool, status int) []byte {
-	raw, _ := json.Marshal(envelope{OK: false, Error: &envelopeError{Code: code, Class: code, Message: msg, Retryable: retryable, HTTPStatus: status}})
+func typedErrorEnvelope(code, msg string, retryable bool, status int, retryAfter ...int) []byte {
+	value := 0
+	if len(retryAfter) > 0 {
+		value = retryAfter[0]
+	}
+	raw, _ := json.Marshal(envelope{OK: false, Error: &envelopeError{Code: code, Class: code, Message: msg, Retryable: retryable, HTTPStatus: status, RetryAfter: value}})
 	return raw
 }
 func writeResponse(response *C.cliproxy_buffer, raw []byte) {
