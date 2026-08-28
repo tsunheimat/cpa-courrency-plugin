@@ -358,6 +358,10 @@ func interceptAfter(raw []byte) ([]byte, error) {
 		if errRelease := authority.Release(context.Background(), old); errRelease != nil {
 			return admissionResponse(&AdmissionError{Code: "account_concurrency_authority_unavailable", HTTPStatus: http.StatusServiceUnavailable, RetryAfter: defaultRetryAfter, Message: "concurrency authority unavailable", Authority: true})
 		}
+		state.mu.Lock()
+		delete(state.leases, req.RequestID)
+		delete(state.bound, req.RequestID)
+		state.mu.Unlock()
 	}
 	lease, err := authority.Acquire(ctx, key, cfg.MaxConcurrency, cfg.WarmReservedSlots, class)
 	if err != nil {
