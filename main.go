@@ -41,6 +41,7 @@ type envelope struct {
 }
 type envelopeError struct {
 	Code       string `json:"code"`
+	Class      string `json:"class,omitempty"`
 	Message    string `json:"message"`
 	Retryable  bool   `json:"retryable,omitempty"`
 	HTTPStatus int    `json:"http_status,omitempty"`
@@ -463,7 +464,7 @@ func errorEnvelope(code, msg string) []byte {
 }
 
 func typedErrorEnvelope(code, msg string, retryable bool, status int) []byte {
-	raw, _ := json.Marshal(envelope{OK: false, Error: &envelopeError{Code: code, Message: msg, Retryable: retryable, HTTPStatus: status}})
+	raw, _ := json.Marshal(envelope{OK: false, Error: &envelopeError{Code: code, Class: code, Message: msg, Retryable: retryable, HTTPStatus: status}})
 	return raw
 }
 func writeResponse(response *C.cliproxy_buffer, raw []byte) {
