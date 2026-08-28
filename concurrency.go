@@ -22,6 +22,8 @@ const (
 	defaultWait         = 50 * time.Millisecond
 	defaultRetryAfter   = 1
 	defaultPollInterval = 5 * time.Millisecond
+	leaseTTL            = 30 * time.Second
+	leaseRenewInterval  = 10 * time.Second
 )
 
 type requestClass uint8
@@ -48,6 +50,7 @@ type Authority interface {
 	Snapshot(context.Context, string, int, int) (Usage, error)
 	Acquire(context.Context, string, int, int, requestClass) (Lease, error)
 	Release(context.Context, Lease) error
+	Renew(context.Context, Lease) error
 }
 
 var ErrAuthorityUnavailable = errors.New("concurrency authority unavailable")
@@ -156,6 +159,18 @@ func (a *localAuthority) Release(_ context.Context, lease Lease) error {
 		u.WarmFlight--
 	}
 	a.usage[stored.Key] = u
+	return nil
+}
+
+func (a *localAuthority) Renew(_ context.Context, lease Lease) error {
+	if a == nil {
+		return ErrAuthorityUnavailable
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if _, ok := a.active[lease.Token]; !ok {
+		return ErrAuthorityUnavailable
+	}
 	return nil
 }
 
@@ -293,7 +308,7 @@ func (a *redisAuthority) Snapshot(ctx context.Context, account string, limit, re
 	if a == nil || a.client == nil {
 		return Usage{}, ErrAuthorityUnavailable
 	}
-	result, err := a.client.Eval(ctx, redisSnapshotScript, []string{a.key(account)})
+	result, err := a.client.Eval(ctx, redisSnapshotScript, []string{a.key(account)}, time.Now().UnixMilli(), leaseTTL.Milliseconds())
 	if err != nil {
 		return Usage{}, fmt.Errorf("%w: %v", ErrAuthorityUnavailable, err)
 	}
@@ -311,7 +326,7 @@ func (a *redisAuthority) Acquire(ctx context.Context, account string, limit, res
 		return Lease{}, ErrAuthorityUnavailable
 	}
 	token := fmt.Sprintf("%x", sha256.Sum256([]byte(account+":"+strconv.FormatInt(time.Now().UnixNano(), 10))))
-	result, err := a.client.Eval(ctx, redisAcquireScript, []string{a.key(account)}, limit, reserved, int(class), token)
+	result, err := a.client.Eval(ctx, redisAcquireScript, []string{a.key(account)}, limit, reserved, int(class), token, time.Now().UnixMilli(), leaseTTL.Milliseconds())
 	if err != nil {
 		return Lease{}, fmt.Errorf("%w: %v", ErrAuthorityUnavailable, err)
 	}
@@ -327,8 +342,23 @@ func (a *redisAuthority) Release(ctx context.Context, lease Lease) error {
 	if a == nil || a.client == nil {
 		return ErrAuthorityUnavailable
 	}
-	if _, err := a.client.Eval(ctx, redisReleaseScript, []string{a.key(lease.Key)}, lease.Token, int(lease.Class)); err != nil {
+	if _, err := a.client.Eval(ctx, redisReleaseScript, []string{a.key(lease.Key)}, lease.Token, int(lease.Class), leaseTTL.Milliseconds()); err != nil {
 		return fmt.Errorf("%w: %v", ErrAuthorityUnavailable, err)
+	}
+	return nil
+}
+
+func (a *redisAuthority) Renew(ctx context.Context, lease Lease) error {
+	if a == nil || a.client == nil {
+		return ErrAuthorityUnavailable
+	}
+	now := time.Now().UnixMilli()
+	result, err := a.client.Eval(ctx, redisRenewScript, []string{a.key(lease.Key)}, lease.Token, now, leaseTTL.Milliseconds())
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrAuthorityUnavailable, err)
+	}
+	if n, ok := toInt(result); !ok || n == 0 {
+		return ErrAuthorityUnavailable
 	}
 	return nil
 }
@@ -350,9 +380,10 @@ func toInt(v any) (int, bool) {
 	}
 }
 
-const redisSnapshotScript = `local i=tonumber(redis.call('HGET',KEYS[1],'inflight') or '0'); local w=tonumber(redis.call('HGET',KEYS[1],'warm') or '0'); return {i,w}`
-const redisAcquireScript = `local i=tonumber(redis.call('HGET',KEYS[1],'inflight') or '0'); local limit=tonumber(ARGV[1]); local reserved=tonumber(ARGV[2]); local class=tonumber(ARGV[3]); local allowed=limit; if class==0 then allowed=limit-reserved; if allowed<1 then allowed=1 end end; if i>=allowed then return 0 end; redis.call('HINCRBY',KEYS[1],'inflight',1); if class==1 then redis.call('HINCRBY',KEYS[1],'warm',1) end; redis.call('HSET',KEYS[1],ARGV[4],class); return 1`
-const redisReleaseScript = `local class=redis.call('HGET',KEYS[1],ARGV[1]); if not class then return 0 end; redis.call('HDEL',KEYS[1],ARGV[1]); redis.call('HINCRBY',KEYS[1],'inflight',-1); if tonumber(class)==1 then redis.call('HINCRBY',KEYS[1],'warm',-1) end; return 1`
+const redisSnapshotScript = `local now=tonumber(ARGV[1] or '0'); local fields=redis.call('HGETALL',KEYS[1]); local i=tonumber(redis.call('HGET',KEYS[1],'inflight') or '0'); local w=tonumber(redis.call('HGET',KEYS[1],'warm') or '0'); for n=1,#fields,2 do local f=fields[n]; local v=fields[n+1]; if f~='inflight' and f~='warm' then local c,e=string.match(v,'^(%d+):(%d+)$'); if c and tonumber(e)<=now then redis.call('HDEL',KEYS[1],f); i=i-1; if tonumber(c)==1 then w=w-1 end end end end; if i<0 then i=0 end; if w<0 then w=0 end; redis.call('HSET',KEYS[1],'inflight',i,'warm',w); if i>0 then redis.call('PEXPIRE',KEYS[1],ARGV[2]) else redis.call('DEL',KEYS[1]) end; return {i,w}`
+const redisAcquireScript = `local now=tonumber(ARGV[5]); local ttl=tonumber(ARGV[6]); local fields=redis.call('HGETALL',KEYS[1]); local i=tonumber(redis.call('HGET',KEYS[1],'inflight') or '0'); local w=tonumber(redis.call('HGET',KEYS[1],'warm') or '0'); for n=1,#fields,2 do local f=fields[n]; local v=fields[n+1]; if f~='inflight' and f~='warm' then local c,e=string.match(v,'^(%d+):(%d+)$'); if c and tonumber(e)<=now then redis.call('HDEL',KEYS[1],f); i=i-1; if tonumber(c)==1 then w=w-1 end end end end; if i<0 then i=0 end; if w<0 then w=0 end; local limit=tonumber(ARGV[1]); local reserved=tonumber(ARGV[2]); local class=tonumber(ARGV[3]); local allowed=limit; if class==0 then allowed=limit-reserved; if allowed<1 then allowed=1 end end; if i>=allowed then redis.call('HSET',KEYS[1],'inflight',i,'warm',w); if i>0 then redis.call('PEXPIRE',KEYS[1],ttl) end; return 0 end; i=i+1; if class==1 then w=w+1 end; redis.call('HSET',KEYS[1],'inflight',i,'warm',w,ARGV[4],class..':'..(now+ttl)); redis.call('PEXPIRE',KEYS[1],ttl); return 1`
+const redisReleaseScript = `local v=redis.call('HGET',KEYS[1],ARGV[1]); if not v then return 0 end; local c=string.match(v,'^(%d+):'); if not c then c=v end; redis.call('HDEL',KEYS[1],ARGV[1]); local i=tonumber(redis.call('HGET',KEYS[1],'inflight') or '0')-1; local w=tonumber(redis.call('HGET',KEYS[1],'warm') or '0'); if tonumber(c)==1 then w=w-1 end; if i<=0 then redis.call('DEL',KEYS[1]); else if w<0 then w=0 end; redis.call('HSET',KEYS[1],'inflight',i,'warm',w); redis.call('PEXPIRE',KEYS[1],ARGV[3]); end; return 1`
+const redisRenewScript = `local v=redis.call('HGET',KEYS[1],ARGV[1]); if not v then return 0 end; local c=string.match(v,'^(%d+):'); if not c then return 0 end; local now=tonumber(ARGV[2]); local ttl=tonumber(ARGV[3]); local _,e=string.match(v,'^(%d+):(%d+)$'); if not e or tonumber(e)<=now then return 0 end; redis.call('HSET',KEYS[1],ARGV[1],c..':'..(now+ttl)); redis.call('PEXPIRE',KEYS[1],ttl); return 1`
 
 type candidateScore struct {
 	id       string

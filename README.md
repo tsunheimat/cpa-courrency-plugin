@@ -42,7 +42,11 @@ binding.
 uses atomic Lua `EVAL` scripts over RESP2 and requires `redis_addr` (with
 optional `redis_password` and `redis_db`). If a distributed authority is
 unavailable, the plugin fails closed with HTTP 503 and does not call the
-provider.
+provider. Redis leases carry a bounded 30-second expiry and are renewed by a
+10-second heartbeat while the request is live. Acquire, expiry reclamation,
+renewal, and release are atomic; release is idempotent. If renewal or any
+authority operation is uncertain, new admissions fail closed until the plugin
+is reconfigured, while the in-flight request remains tracked for cleanup.
 
 ## Lifecycle and failover
 

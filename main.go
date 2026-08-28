@@ -75,13 +75,25 @@ type pluginConfig struct {
 
 type pluginState struct {
 	mu        sync.Mutex
+	gate      sync.RWMutex // serializes shutdown/reconfigure against callbacks
 	cfg       pluginConfig
 	authority Authority
 	leases    map[string]Lease
 	bound     map[string]string
+	requests  map[string]*requestLifecycle
+	stopping  bool
+	uncertain bool
 }
 
-var state = pluginState{cfg: defaultConfig(), authority: newLocalAuthority(), leases: make(map[string]Lease), bound: make(map[string]string)}
+type requestLifecycle struct {
+	mu       sync.Mutex
+	terminal bool
+	lease    Lease
+	bound    string
+	stopBeat chan struct{}
+}
+
+var state = pluginState{cfg: defaultConfig(), authority: newLocalAuthority(), leases: make(map[string]Lease), bound: make(map[string]string), requests: make(map[string]*requestLifecycle)}
 
 func defaultConfig() pluginConfig {
 	return pluginConfig{Enabled: true, MaxConcurrency: defaultLimit, WarmReservedSlots: 0, WaitTimeout: defaultWait, Authority: "local", RedisPrefix: "cpa:concurrency"}
@@ -138,6 +150,8 @@ func cliproxyPluginFree(ptr unsafe.Pointer, _ C.size_t) {
 
 //export cliproxyPluginShutdown
 func cliproxyPluginShutdown() {
+	state.gate.Lock()
+	defer state.gate.Unlock()
 	state.mu.Lock()
 	leases := make([]Lease, 0, len(state.leases))
 	for _, lease := range state.leases {
@@ -146,7 +160,22 @@ func cliproxyPluginShutdown() {
 	authority := state.authority
 	state.leases = make(map[string]Lease)
 	state.bound = make(map[string]string)
+	state.stopping = true
+	state.uncertain = false
+	requests := make([]*requestLifecycle, 0, len(state.requests))
+	for _, rs := range state.requests {
+		requests = append(requests, rs)
+	}
 	state.mu.Unlock()
+	for _, rs := range requests {
+		rs.mu.Lock()
+		rs.terminal = true
+		if rs.stopBeat != nil {
+			close(rs.stopBeat)
+			rs.stopBeat = nil
+		}
+		rs.mu.Unlock()
+	}
 	for _, lease := range leases {
 		if authority != nil {
 			_ = authority.Release(context.Background(), lease)
@@ -175,6 +204,8 @@ func handleMethod(method string, raw []byte) ([]byte, error) {
 }
 
 func configure(raw []byte) error {
+	state.gate.Lock()
+	defer state.gate.Unlock()
 	var req lifecycleRequest
 	if len(raw) > 0 {
 		if err := json.Unmarshal(raw, &req); err != nil {
@@ -221,6 +252,8 @@ func configure(raw []byte) error {
 		return fmt.Errorf("redis_addr is required when authority is redis")
 	}
 	state.mu.Lock()
+	state.stopping = false
+	state.uncertain = false
 	if len(state.leases) > 0 && state.cfg.Authority != "" && state.cfg.Authority != cfg.Authority {
 		state.mu.Unlock()
 		return fmt.Errorf("cannot change concurrency authority while requests are in flight")
@@ -252,17 +285,19 @@ func pluginRegistration() registration {
 }
 
 func schedulerPick(raw []byte) ([]byte, error) {
+	state.gate.RLock()
+	defer state.gate.RUnlock()
 	var req pluginapi.SchedulerPickRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
 	}
 	state.mu.Lock()
-	cfg, authority := state.cfg, state.authority
+	cfg, authority, uncertain := state.cfg, state.authority, state.uncertain
 	state.mu.Unlock()
 	if !cfg.Enabled {
 		return okEnvelope(pluginapi.SchedulerPickResponse{Handled: false})
 	}
-	if authority == nil {
+	if authority == nil || uncertain {
 		return nil, &AdmissionError{Code: "account_concurrency_authority_unavailable", HTTPStatus: http.StatusServiceUnavailable, RetryAfter: defaultRetryAfter, Message: "concurrency authority unavailable", Authority: true}
 	}
 	ids := make([]string, 0, len(req.Candidates))
@@ -312,6 +347,7 @@ func authorityError(err error) error {
 	if errors.As(err, &ae) {
 		return err
 	}
+	markAuthorityUncertain()
 	return &AdmissionError{Code: "account_concurrency_authority_unavailable", HTTPStatus: http.StatusServiceUnavailable, RetryAfter: defaultRetryAfter, Message: "concurrency authority unavailable", Authority: true}
 }
 
@@ -328,8 +364,19 @@ func interceptAfter(raw []byte) ([]byte, error) {
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
 	}
+	state.gate.RLock()
+	defer state.gate.RUnlock()
 	state.mu.Lock()
 	cfg, authority := state.cfg, state.authority
+	if state.stopping || state.uncertain {
+		state.mu.Unlock()
+		return admissionResponse(&AdmissionError{Code: "account_concurrency_authority_unavailable", HTTPStatus: http.StatusServiceUnavailable, RetryAfter: defaultRetryAfter, Message: "concurrency authority unavailable", Authority: true})
+	}
+	rs := state.requests[req.RequestID]
+	if rs == nil {
+		rs = &requestLifecycle{}
+		state.requests[req.RequestID] = rs
+	}
 	state.mu.Unlock()
 	if !cfg.Enabled || req.AuthID == "" {
 		return okEnvelope(pluginapi.RequestInterceptResponse{Headers: req.Headers, Body: req.Body})
@@ -349,23 +396,33 @@ func interceptAfter(raw []byte) ([]byte, error) {
 		ctx, cancel = context.WithTimeout(ctx, cfg.WaitTimeout)
 		defer cancel()
 	}
-	state.mu.Lock()
-	old, bound := state.leases[req.RequestID], state.bound[req.RequestID]
-	state.mu.Unlock()
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if rs.terminal {
+		return okEnvelope(pluginapi.RequestInterceptResponse{Headers: req.Headers, Body: req.Body})
+	}
+	old, bound := rs.lease, rs.bound
 	if bound == req.AuthID && old.Token != "" {
 		return okEnvelope(pluginapi.RequestInterceptResponse{Headers: req.Headers, Body: req.Body})
 	}
 	if old.Token != "" {
 		if errRelease := authority.Release(context.Background(), old); errRelease != nil {
+			markAuthorityUncertain()
 			return admissionResponse(&AdmissionError{Code: "account_concurrency_authority_unavailable", HTTPStatus: http.StatusServiceUnavailable, RetryAfter: defaultRetryAfter, Message: "concurrency authority unavailable", Authority: true})
 		}
 		state.mu.Lock()
 		delete(state.leases, req.RequestID)
 		delete(state.bound, req.RequestID)
 		state.mu.Unlock()
+		rs.lease = Lease{}
+		rs.bound = ""
+		stopHeartbeat(rs)
 	}
 	lease, err := authority.Acquire(ctx, key, cfg.MaxConcurrency, cfg.WarmReservedSlots, class)
 	if err != nil {
+		if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+			markAuthorityUncertain()
+		}
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 			err = &AdmissionError{Code: "account_concurrency_limit", HTTPStatus: http.StatusServiceUnavailable, RetryAfter: defaultRetryAfter, Message: "account concurrency limit reached"}
 		}
@@ -379,6 +436,8 @@ func interceptAfter(raw []byte) ([]byte, error) {
 	state.leases[req.RequestID] = lease
 	state.bound[req.RequestID] = req.AuthID
 	state.mu.Unlock()
+	rs.lease, rs.bound = lease, req.AuthID
+	startHeartbeat(rs, authority, lease)
 	return okEnvelope(pluginapi.RequestInterceptResponse{Headers: req.Headers, Body: req.Body})
 }
 
@@ -387,16 +446,84 @@ func complete(raw []byte) ([]byte, error) {
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
 	}
+	state.gate.RLock()
+	defer state.gate.RUnlock()
 	state.mu.Lock()
-	lease, ok := state.leases[req.RequestID]
+	rs := state.requests[req.RequestID]
+	if rs == nil {
+		rs = &requestLifecycle{}
+		state.requests[req.RequestID] = rs
+	}
+	state.mu.Unlock()
+	rs.mu.Lock()
+	if rs.terminal {
+		rs.mu.Unlock()
+		return okEnvelope(struct{}{})
+	}
+	rs.terminal = true
+	lease := rs.lease
+	ok := lease.Token != ""
+	stopHeartbeat(rs)
+	rs.lease = Lease{}
+	rs.bound = ""
+	state.mu.Lock()
 	delete(state.leases, req.RequestID)
 	delete(state.bound, req.RequestID)
 	authority := state.authority
 	state.mu.Unlock()
+	rs.mu.Unlock()
 	if ok && authority != nil {
-		_ = authority.Release(context.Background(), lease)
+		if err := authority.Release(context.Background(), lease); err != nil {
+			markAuthorityUncertain()
+		}
 	}
 	return okEnvelope(struct{}{})
+}
+
+func markAuthorityUncertain() {
+	state.mu.Lock()
+	state.uncertain = true
+	state.mu.Unlock()
+}
+
+func startHeartbeat(rs *requestLifecycle, authority Authority, lease Lease) {
+	if authority == nil || lease.Token == "" {
+		return
+	}
+	stopHeartbeat(rs)
+	stop := make(chan struct{})
+	rs.stopBeat = stop
+	go func() {
+		t := time.NewTicker(leaseRenewInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-t.C:
+				rs.mu.Lock()
+				if rs.terminal || rs.lease.Token != lease.Token {
+					rs.mu.Unlock()
+					return
+				}
+				if err := authority.Renew(context.Background(), lease); err != nil {
+					rs.mu.Unlock()
+					// Renewal uncertainty is fail-closed for future admissions; the
+					// current request still owns its local lifecycle until completion.
+					markAuthorityUncertain()
+					return
+				}
+				rs.mu.Unlock()
+			case <-stop:
+				return
+			}
+		}
+	}()
+}
+
+func stopHeartbeat(rs *requestLifecycle) {
+	if rs.stopBeat != nil {
+		close(rs.stopBeat)
+		rs.stopBeat = nil
+	}
 }
 
 func admissionResponse(err *AdmissionError) ([]byte, error) {

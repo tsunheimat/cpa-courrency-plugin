@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,7 +19,36 @@ func resetTestState() {
 	state.authority = newLocalAuthority()
 	state.leases = make(map[string]Lease)
 	state.bound = make(map[string]string)
+	state.requests = make(map[string]*requestLifecycle)
+	state.stopping = false
 	state.mu.Unlock()
+}
+
+type countingAuthority struct {
+	*localAuthority
+	mu       sync.Mutex
+	acquires int
+	releases int
+	renews   int
+}
+
+func (a *countingAuthority) Acquire(ctx context.Context, key string, limit, reserved int, class requestClass) (Lease, error) {
+	a.mu.Lock()
+	a.acquires++
+	a.mu.Unlock()
+	return a.localAuthority.Acquire(ctx, key, limit, reserved, class)
+}
+func (a *countingAuthority) Release(ctx context.Context, l Lease) error {
+	a.mu.Lock()
+	a.releases++
+	a.mu.Unlock()
+	return a.localAuthority.Release(ctx, l)
+}
+func (a *countingAuthority) Renew(ctx context.Context, l Lease) error {
+	a.mu.Lock()
+	a.renews++
+	a.mu.Unlock()
+	return a.localAuthority.Renew(ctx, l)
 }
 
 func TestLocalAuthorityHardCapAndExactlyOnceRelease(t *testing.T) {
@@ -223,5 +253,252 @@ func TestDefaultReservationFormula(t *testing.T) {
 		if got != want {
 			t.Fatalf("limit %d reservation = %d, want %d", limit, got, want)
 		}
+	}
+}
+
+func TestConcurrentCallbacksSerializePerRequest(t *testing.T) {
+	resetTestState()
+	a := &countingAuthority{localAuthority: newLocalAuthority()}
+	state.mu.Lock()
+	state.authority = a
+	state.mu.Unlock()
+	raw, _ := json.Marshal(pluginapi.RequestInterceptRequest{RequestID: "concurrent", AuthID: "acct"})
+	var wg sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); _, _ = interceptAfter(raw) }()
+	}
+	wg.Wait()
+	a.mu.Lock()
+	gotAcquire, gotRelease := a.acquires, a.releases
+	a.mu.Unlock()
+	if gotAcquire != 1 || gotRelease != 0 {
+		t.Fatalf("duplicate callbacks acquire/release = %d/%d, want 1/0", gotAcquire, gotRelease)
+	}
+	completion, _ := json.Marshal(pluginapi.RequestCompletion{RequestID: "concurrent"})
+	_, _ = complete(completion)
+	a.mu.Lock()
+	gotRelease = a.releases
+	a.mu.Unlock()
+	if gotRelease != 1 {
+		t.Fatalf("completion releases = %d, want 1", gotRelease)
+	}
+}
+
+func TestCompletionTombstonePreventsLateAcquire(t *testing.T) {
+	resetTestState()
+	a := &countingAuthority{localAuthority: newLocalAuthority()}
+	state.mu.Lock()
+	state.authority = a
+	state.mu.Unlock()
+	completion, _ := json.Marshal(pluginapi.RequestCompletion{RequestID: "late"})
+	if _, err := complete(completion); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(pluginapi.RequestInterceptRequest{RequestID: "late", AuthID: "acct"})
+	if _, err := interceptAfter(raw); err != nil {
+		t.Fatal(err)
+	}
+	a.mu.Lock()
+	got := a.acquires
+	a.mu.Unlock()
+	if got != 0 {
+		t.Fatalf("late callback acquired %d leases", got)
+	}
+}
+
+func TestShutdownMarksRequestsTerminalAndRejectsAdmission(t *testing.T) {
+	resetTestState()
+	a := &countingAuthority{localAuthority: newLocalAuthority()}
+	state.mu.Lock()
+	state.authority = a
+	state.mu.Unlock()
+	raw, _ := json.Marshal(pluginapi.RequestInterceptRequest{RequestID: "shutdown", AuthID: "acct"})
+	if _, err := interceptAfter(raw); err != nil {
+		t.Fatal(err)
+	}
+	cliproxyPluginShutdown()
+	if _, err := interceptAfter(raw); err != nil {
+		t.Fatal(err)
+	}
+	a.mu.Lock()
+	acquires, releases := a.acquires, a.releases
+	a.mu.Unlock()
+	if acquires != 1 || releases != 1 {
+		t.Fatalf("shutdown acquire/release = %d/%d, want 1/1", acquires, releases)
+	}
+}
+
+func TestRedisLeaseLifecycleArgumentsAndIdempotentRelease(t *testing.T) {
+	f := &recordingRedis{}
+	a := newRedisAuthority(f, "cpa:test")
+	l, err := a.Acquire(context.Background(), "acct", 2, 1, classWarm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.acquireTTL <= 0 {
+		t.Fatalf("acquire ttl = %d", f.acquireTTL)
+	}
+	if err := a.Renew(context.Background(), l); err != nil {
+		t.Fatal(err)
+	}
+	if f.renewTTL <= 0 {
+		t.Fatalf("renew ttl = %d", f.renewTTL)
+	}
+	if err := a.Release(context.Background(), l); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Release(context.Background(), l); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRedisFakeExpiryRenewalAndCrashRecovery(t *testing.T) {
+	f := newLeaseFakeRedis()
+	a := newRedisAuthority(f, "cpa:test")
+	one, err := a.Acquire(context.Background(), "acct", 1, 0, classWarm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = a.Acquire(context.Background(), "acct", 1, 0, classWarm); err == nil {
+		t.Fatal("second acquire exceeded fake hard cap")
+	}
+	f.expire(one.Token)
+	if _, err = a.Acquire(context.Background(), "acct", 1, 0, classWarm); err != nil {
+		t.Fatalf("expired lease did not recover: %v", err)
+	}
+	// A live lease is extended by renewal and remains occupied.
+	live, err := a.Acquire(context.Background(), "other", 2, 0, classWarm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = a.Renew(context.Background(), live); err != nil {
+		t.Fatal(err)
+	}
+	f.expire(live.Token)
+	if err = a.Renew(context.Background(), live); err == nil {
+		t.Fatal("renewal unexpectedly revived an expired lease")
+	}
+	if err = a.Release(context.Background(), live); err != nil {
+		t.Fatal(err)
+	}
+	if err = a.Release(context.Background(), live); err != nil {
+		t.Fatal(err)
+	}
+}
+
+type recordingRedis struct {
+	acquireTTL, renewTTL int64
+	released             int
+}
+
+func (f *recordingRedis) Eval(_ context.Context, script string, _ []string, args ...any) (any, error) {
+	switch script {
+	case redisAcquireScript:
+		f.acquireTTL, _ = toInt64(args[5])
+		return int64(1), nil
+	case redisRenewScript:
+		f.renewTTL, _ = toInt64(args[2])
+		return int64(1), nil
+	case redisReleaseScript:
+		f.released++
+		return int64(0), nil
+	default:
+		return []any{int64(0), int64(0)}, nil
+	}
+}
+func toInt64(v any) (int64, bool) {
+	switch n := v.(type) {
+	case int64:
+		return n, true
+	case int:
+		return int64(n), true
+	default:
+		return 0, false
+	}
+}
+
+type fakeRedisEntry struct {
+	class  int
+	expiry int64
+}
+type leaseFakeRedis struct {
+	mu      sync.Mutex
+	entries map[string]fakeRedisEntry
+}
+
+func newLeaseFakeRedis() *leaseFakeRedis {
+	return &leaseFakeRedis{entries: make(map[string]fakeRedisEntry)}
+}
+func (f *leaseFakeRedis) expire(token string) {
+	f.mu.Lock()
+	if e, ok := f.entries[token]; ok {
+		e.expiry = 0
+		f.entries[token] = e
+	}
+	f.mu.Unlock()
+}
+func (f *leaseFakeRedis) clean(now int64) {
+	for token, e := range f.entries {
+		if e.expiry <= now {
+			delete(f.entries, token)
+		}
+	}
+}
+func (f *leaseFakeRedis) Eval(_ context.Context, script string, keys []string, args ...any) (any, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	now := time.Now().UnixMilli()
+	if len(args) > 4 {
+		if n, ok := toInt64(args[4]); ok {
+			now = n
+		}
+	}
+	f.clean(now)
+	switch script {
+	case redisAcquireScript:
+		limit, _ := toInt64(args[0])
+		reserved, _ := toInt64(args[1])
+		class, _ := toInt64(args[2])
+		token, _ := args[3].(string)
+		ttl, _ := toInt64(args[5])
+		allowed := limit
+		if class == 0 && limit-reserved > 0 {
+			allowed = limit - reserved
+		}
+		if int64(len(f.entries)) >= allowed {
+			return int64(0), nil
+		}
+		f.entries[token] = fakeRedisEntry{class: int(class), expiry: now + ttl}
+		return int64(1), nil
+	case redisRenewScript:
+		token, _ := args[0].(string)
+		now, _ := toInt64(args[1])
+		ttl, _ := toInt64(args[2])
+		e, ok := f.entries[token]
+		if !ok || e.expiry <= now {
+			return int64(0), nil
+		}
+		e.expiry = now + ttl
+		f.entries[token] = e
+		return int64(1), nil
+	case redisReleaseScript:
+		token, _ := args[0].(string)
+		if _, ok := f.entries[token]; !ok {
+			return int64(0), nil
+		}
+		delete(f.entries, token)
+		return int64(1), nil
+	case redisSnapshotScript:
+		warm := 0
+		for _, e := range f.entries {
+			if e.class == 1 {
+				warm++
+			}
+		}
+		return []any{int64(len(f.entries)), int64(warm)}, nil
+	default:
+		_ = keys
+		return nil, errors.New("unknown script")
 	}
 }
