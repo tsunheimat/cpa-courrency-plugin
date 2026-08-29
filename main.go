@@ -70,6 +70,118 @@ type registrationCapabilities struct {
 	RequestInterceptor                  bool `json:"request_interceptor"`
 	RequestInterceptorEnforcesAdmission bool `json:"request_interceptor_enforces_admission"`
 	RequestLifecyclePlugin              bool `json:"request_lifecycle_plugin"`
+	ManagementAPI                       bool `json:"management_api"`
+}
+
+type managementRegistrationPayload struct {
+	Routes    []pluginapi.ManagementRoute `json:"routes,omitempty"`
+	Resources []pluginapi.ResourceRoute   `json:"resources,omitempty"`
+}
+
+type concurrencySnapshot struct {
+	ConfiguredLimit   int            `json:"configured_limit"`
+	WarmReserved      int            `json:"warm_reserved"`
+	InFlight          int            `json:"in_flight"`
+	WarmInFlight      int            `json:"warm_in_flight"`
+	GeneralInFlight   int            `json:"general_in_flight"`
+	GeneralCapacity   int            `json:"general_capacity"`
+	AvailableCapacity int            `json:"available_capacity"`
+	Authority         string         `json:"authority"`
+	AuthorityState    string         `json:"authority_state"`
+	CapacityState     string         `json:"capacity_state"`
+	AccountsInUse     int            `json:"accounts_in_use"`
+	Empty             bool           `json:"empty"`
+	LastRefresh       time.Time      `json:"last_refresh"`
+	Stale             bool           `json:"stale"`
+	Error             string         `json:"error,omitempty"`
+	Accounts          []AccountUsage `json:"accounts,omitempty"`
+}
+
+const (
+	managementUsagePath = "/plugins/cpa-account-concurrency/usage"
+	managementUIPath    = "/ui"
+)
+
+type managementHandler struct{}
+
+func managementRegistrationResponse() managementRegistrationPayload {
+	return managementRegistrationPayload{
+		Routes:    []pluginapi.ManagementRoute{{Method: http.MethodGet, Path: managementUsagePath}},
+		Resources: []pluginapi.ResourceRoute{{Path: managementUIPath, Menu: "CPA concurrency", Description: "Live CPA account concurrency"}},
+	}
+}
+
+func (managementHandler) HandleManagement(ctx context.Context, req pluginapi.ManagementRequest) (pluginapi.ManagementResponse, error) {
+	if req.Path == managementUIPath || strings.HasSuffix(req.Path, managementUIPath) {
+		return pluginapi.ManagementResponse{StatusCode: http.StatusOK, Headers: http.Header{"Content-Type": []string{"text/html; charset=utf-8"}, "Cache-Control": []string{"no-store"}}, Body: []byte(managementHTML)}, nil
+	}
+	if req.Method != http.MethodGet {
+		return pluginapi.ManagementResponse{StatusCode: http.StatusMethodNotAllowed, Headers: http.Header{"Allow": []string{http.MethodGet}, "Content-Type": []string{"application/json"}}, Body: []byte(`{"error":"method_not_allowed"}`)}, nil
+	}
+	snapshot := readConcurrencySnapshot(ctx)
+	body, err := json.Marshal(snapshot)
+	if err != nil {
+		return pluginapi.ManagementResponse{}, err
+	}
+	return pluginapi.ManagementResponse{StatusCode: http.StatusOK, Headers: http.Header{"Content-Type": []string{"application/json"}, "Cache-Control": []string{"no-store"}}, Body: body}, nil
+}
+
+func readConcurrencySnapshot(ctx context.Context) concurrencySnapshot {
+	state.gate.RLock()
+	defer state.gate.RUnlock()
+	state.mu.Lock()
+	cfg, authority, uncertain, stopping := state.cfg, state.authority, state.uncertain, state.stopping
+	state.mu.Unlock()
+	s := concurrencySnapshot{ConfiguredLimit: cfg.MaxConcurrency, WarmReserved: cfg.WarmReservedSlots, GeneralCapacity: maxInt(0, cfg.MaxConcurrency-cfg.WarmReservedSlots), Authority: cfg.Authority, AuthorityState: "available", CapacityState: "available", LastRefresh: time.Now().UTC()}
+	if stopping || uncertain || authority == nil {
+		s.AuthorityState = "unavailable"
+		s.CapacityState = "unavailable"
+		s.Stale = true
+		s.Error = "concurrency authority unavailable"
+		return s
+	}
+	if local, ok := authority.(*localAuthority); ok {
+		u, accounts, err := local.AggregateSnapshot(ctx, cfg.MaxConcurrency, cfg.WarmReservedSlots)
+		if err != nil {
+			s.AuthorityState, s.Stale, s.Error = "unavailable", true, "concurrency authority unavailable"
+			return s
+		}
+		s.InFlight, s.WarmInFlight, s.AccountsInUse = u.InFlight, u.WarmFlight, accounts
+		if listed, listErr := local.AccountSnapshots(ctx, cfg.MaxConcurrency, cfg.WarmReservedSlots); listErr == nil {
+			s.Accounts = listed
+		}
+	} else {
+		// Redis authority has no account index; report configured state without
+		// fabricating usage or exposing key material.
+		s.AuthorityState = "connected"
+	}
+	s.GeneralInFlight = maxInt(0, s.InFlight-s.WarmInFlight)
+	s.AvailableCapacity = maxInt(0, s.ConfiguredLimit-s.InFlight)
+	s.Empty = s.InFlight == 0
+	if s.Empty {
+		s.CapacityState = "empty"
+	} else if s.AvailableCapacity == 0 {
+		s.CapacityState = "full"
+	}
+	return s
+}
+
+const managementHTML = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>CPA concurrency</title><style>body{font:16px system-ui,sans-serif;max-width:760px;margin:2rem auto;padding:0 1rem;color:#17202a}h1{font-size:1.5rem}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1rem}.metric{border:1px solid #b8c2cc;border-radius:6px;padding:1rem}.value{font-size:1.6rem;font-weight:650;margin-top:.25rem}.label{font-size:.85rem;color:#4b5563}#state{margin:1rem 0;padding:.75rem;border-left:4px solid #4b5563;background:#f3f4f6}button{padding:.5rem .75rem;font:inherit}table{width:100%;border-collapse:collapse;margin-top:1.25rem}th,td{text-align:left;border-bottom:1px solid #d1d5db;padding:.5rem;font-variant-numeric:tabular-nums}</style></head><body><h1>CPA account concurrency</h1><p><button id="refresh">Refresh now</button> <span id="updated" aria-live="polite"></span></p><div id="state" role="status" aria-live="polite">Loading live usage...</div><div class="grid" id="metrics"></div><table><caption>Active redacted account buckets</caption><thead><tr><th scope="col">Account key</th><th scope="col">In flight</th><th scope="col">Warm</th><th scope="col">Available</th></tr></thead><tbody id="accounts"></tbody></table><script>(function(){const api='/v0/management/plugins/cpa-account-concurrency/usage';const state=document.getElementById('state'),metrics=document.getElementById('metrics'),accounts=document.getElementById('accounts'),updated=document.getElementById('updated');function render(d){const labels=[['Configured limit','configured_limit'],['Warm reserved','warm_reserved'],['In flight','in_flight'],['Warm in flight','warm_in_flight'],['General in flight','general_in_flight'],['Available capacity','available_capacity']];metrics.innerHTML=labels.map(x=>'<div class="metric"><div class="label">'+x[0]+'</div><div class="value">'+(d[x[1]]??'--')+'</div></div>').join('');accounts.innerHTML=(d.accounts||[]).map(a=>'<tr><td><code>'+a.key+'</code></td><td>'+a.in_flight+'</td><td>'+a.warm_flight+'</td><td>'+Math.max(0,a.limit-a.in_flight)+'</td></tr>').join('');let msg='Authority: '+(d.authority_state||'unknown')+'; capacity: '+(d.capacity_state||'unknown');if(d.empty)msg+='; no active accounts';if(d.stale)msg+='; stale';if(d.error)msg+='; '+d.error;state.textContent=msg;updated.textContent=d.last_refresh?'Last refresh '+new Date(d.last_refresh).toLocaleTimeString():''}async function load(){state.textContent='Loading live usage...';try{const r=await fetch(api,{credentials:'same-origin',cache:'no-store'});if(!r.ok)throw new Error('HTTP '+r.status);render(await r.json())}catch(e){state.textContent='Unable to load live usage. '+e.message;metrics.innerHTML='';accounts.innerHTML=''}}document.getElementById('refresh').onclick=load;load();setInterval(load,5000)})()</script></body></html>`
+
+type managementRPCRequest struct {
+	pluginapi.ManagementRequest
+}
+
+func handleManagement(raw []byte) ([]byte, error) {
+	var req managementRPCRequest
+	if err := json.Unmarshal(raw, &req); err != nil {
+		return nil, err
+	}
+	resp, err := (managementHandler{}).HandleManagement(context.Background(), req.ManagementRequest)
+	if err != nil {
+		return nil, err
+	}
+	return okEnvelope(resp)
 }
 
 type pluginConfig struct {
@@ -229,6 +341,10 @@ func handleMethod(method string, raw []byte) ([]byte, error) {
 		return interceptAfter(raw)
 	case pluginabi.MethodRequestComplete:
 		return complete(raw)
+	case pluginabi.MethodManagementRegister:
+		return okEnvelope(managementRegistrationResponse())
+	case pluginabi.MethodManagementHandle:
+		return handleManagement(raw)
 	default:
 		return errorEnvelope("unknown_method", "unknown method: "+method), nil
 	}
@@ -362,7 +478,7 @@ func pluginRegistration() registration {
 		{Name: "redis_addr", Type: pluginapi.ConfigFieldTypeString, Description: "Redis address when authority is redis."},
 		{Name: "redis_password", Type: pluginapi.ConfigFieldTypeString, Description: "Redis password when authority is redis."},
 		{Name: "redis_db", Type: pluginapi.ConfigFieldTypeInteger, Description: "Redis database number."},
-	}}, Capabilities: registrationCapabilities{Scheduler: true, RequestInterceptor: true, RequestInterceptorEnforcesAdmission: true, RequestLifecyclePlugin: true}}
+	}}, Capabilities: registrationCapabilities{Scheduler: true, RequestInterceptor: true, RequestInterceptorEnforcesAdmission: true, RequestLifecyclePlugin: true, ManagementAPI: true}}
 }
 
 func schedulerPick(raw []byte) ([]byte, error) {

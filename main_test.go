@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -49,6 +50,115 @@ func TestPluginRegistrationIncludesRequiredRepositoryMetadata(t *testing.T) {
 	if reg.Metadata.Name != pluginID || !reg.Capabilities.Scheduler || !reg.Capabilities.RequestInterceptorEnforcesAdmission {
 		t.Fatalf("registration = %#v", reg)
 	}
+	if !reg.Capabilities.ManagementAPI {
+		t.Fatal("registration omitted management_api capability")
+	}
+}
+
+func TestManagementRegistrationAndLiveSnapshotAreReadOnlyAndRedacted(t *testing.T) {
+	resetTestState()
+	reg, err := handleMethod(pluginabi.MethodManagementRegister, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(reg), managementUsagePath) || !strings.Contains(string(reg), managementUIPath) {
+		t.Fatalf("registration = %s", reg)
+	}
+	raw, _ := json.Marshal(pluginapi.RequestInterceptRequest{RequestID: "mgmt", AuthID: "account-secret@example.com"})
+	if _, err := interceptAfter(raw); err != nil {
+		t.Fatal(err)
+	}
+	before := len(state.leases)
+	request, _ := json.Marshal(managementRPCRequest{ManagementRequest: pluginapi.ManagementRequest{Method: http.MethodGet, Path: managementUsagePath}})
+	out, err := handleMethod(pluginabi.MethodManagementHandle, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(out), "account-secret") || strings.Contains(string(out), "@example.com") {
+		t.Fatalf("snapshot leaked account identity: %s", out)
+	}
+	var env envelope
+	if err := json.Unmarshal(out, &env); err != nil {
+		t.Fatal(err)
+	}
+	var managementResp pluginapi.ManagementResponse
+	if err := json.Unmarshal(env.Result, &managementResp); err != nil {
+		t.Fatal(err)
+	}
+	var snapshot concurrencySnapshot
+	if err := json.Unmarshal(managementResp.Body, &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.InFlight != 1 || snapshot.ConfiguredLimit != 2 || snapshot.WarmReserved != 1 || snapshot.AvailableCapacity != 1 {
+		t.Fatalf("snapshot = %#v", snapshot)
+	}
+	if got := len(state.leases); got != before {
+		t.Fatalf("snapshot mutated leases: before=%d after=%d", before, got)
+	}
+}
+
+func TestManagementUIContainsAuthenticatedRefreshAndFailureStates(t *testing.T) {
+	resp, err := (managementHandler{}).HandleManagement(context.Background(), pluginapi.ManagementRequest{Method: http.MethodGet, Path: "/v0/resource/plugins/" + pluginID + "/ui"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(resp.Body)
+	if strings.Contains(body, `"in_flight":`) || strings.Contains(body, `"accounts_in_use":`) {
+		t.Fatal("unauthenticated resource embeds live allocation values")
+	}
+	for _, want := range []string{"/v0/management/plugins/cpa-account-concurrency/usage", "credentials:'same-origin'", "Loading live usage", "Unable to load live usage", "stale", "no active accounts", "aria-live"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("UI missing %q", want)
+		}
+	}
+}
+
+func TestManagementSnapshotReportsAuthorityUnavailableWithoutSecrets(t *testing.T) {
+	resetTestState()
+	state.mu.Lock()
+	state.authority = nil
+	state.cfg.RedisPassword = "do-not-leak"
+	state.cfg.Authority = "redis"
+	state.uncertain = true
+	state.mu.Unlock()
+	request, _ := json.Marshal(managementRPCRequest{ManagementRequest: pluginapi.ManagementRequest{Method: http.MethodGet, Path: managementUsagePath}})
+	out, err := handleMethod(pluginabi.MethodManagementHandle, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(out), "do-not-leak") {
+		t.Fatalf("snapshot leaked configuration secret: %s", out)
+	}
+	var env envelope
+	if err := json.Unmarshal(out, &env); err != nil {
+		t.Fatal(err)
+	}
+	var managementResp pluginapi.ManagementResponse
+	if err := json.Unmarshal(env.Result, &managementResp); err != nil {
+		t.Fatal(err)
+	}
+	var snapshot concurrencySnapshot
+	if err := json.Unmarshal(managementResp.Body, &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if !snapshot.Stale || snapshot.AuthorityState != "unavailable" || snapshot.Error == "" {
+		t.Fatalf("unavailable snapshot = %#v", snapshot)
+	}
+}
+
+func TestManagementSnapshotRaceSafe(t *testing.T) {
+	resetTestState()
+	var wg sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				_ = readConcurrencySnapshot(context.Background())
+			}
+		}()
+	}
+	wg.Wait()
 }
 
 func TestHotReloadFailsClosedUntilInflightLeaseCompletes(t *testing.T) {

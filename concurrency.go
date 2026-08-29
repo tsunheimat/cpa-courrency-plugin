@@ -46,6 +46,53 @@ type Usage struct {
 	WarmFlight int
 }
 
+type AccountUsage struct {
+	Key        string
+	Limit      int
+	Reserved   int
+	InFlight   int
+	WarmFlight int
+}
+
+// AggregateSnapshot returns process-local usage without exposing authority keys.
+// It is intentionally a separate read path so management inspection never
+// participates in admission or mutates leases.
+func (a *localAuthority) AggregateSnapshot(_ context.Context, limit, reserved int) (Usage, int, error) {
+	if a == nil {
+		return Usage{}, 0, ErrAuthorityUnavailable
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	var total Usage
+	accounts := 0
+	for _, u := range a.usage {
+		if u.InFlight > 0 {
+			accounts++
+		}
+		total.InFlight += u.InFlight
+		total.WarmFlight += u.WarmFlight
+	}
+	total.Limit, total.Reserved = limit, reserved
+	return total, accounts, nil
+}
+
+func (a *localAuthority) AccountSnapshots(_ context.Context, limit, reserved int) ([]AccountUsage, error) {
+	if a == nil {
+		return nil, ErrAuthorityUnavailable
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	accounts := make([]AccountUsage, 0, len(a.usage))
+	for key, u := range a.usage {
+		if u.InFlight == 0 {
+			continue
+		}
+		accounts = append(accounts, AccountUsage{Key: key, Limit: limit, Reserved: reserved, InFlight: u.InFlight, WarmFlight: u.WarmFlight})
+	}
+	sort.Slice(accounts, func(i, j int) bool { return accounts[i].Key < accounts[j].Key })
+	return accounts, nil
+}
+
 type Authority interface {
 	Snapshot(context.Context, string, int, int) (Usage, error)
 	Acquire(context.Context, string, int, int, requestClass) (Lease, error)
