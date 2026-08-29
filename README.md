@@ -42,6 +42,17 @@ CPA session-affinity selector publishes that pair only on a validated cache hit.
 On a retry/failover, the binding must match the selected auth or the attempt is
 cold and uses general capacity.
 
+## Management observability
+
+The CPA concurrency management view reads the existing authenticated
+`/v0/management/plugins/cpa-account-concurrency/usage` route and uses CPA's
+stock `host.auth.list` callback to enrich each hashed usage bucket with redacted
+account metadata. Labels prefer the auth email, then the CPA auth JSON
+filename/name, and finally the existing hashed account key. Each active account
+shows its own `in_flight / limit` value (for example, `1 / 2`). The plugin never
+requests or stores auth JSON, tokens, passwords, or a plugin-specific
+management key.
+
 ## Authority modes
 
 `local` is process-local and is the safe default for one CPA instance. `redis`

@@ -48,6 +48,7 @@ type Usage struct {
 
 type AccountUsage struct {
 	Key        string `json:"key"`
+	Label      string `json:"label,omitempty"`
 	Limit      int    `json:"limit"`
 	Reserved   int    `json:"reserved"`
 	InFlight   int    `json:"in_flight"`

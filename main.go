@@ -4,7 +4,9 @@ package main
 #include <stdint.h>
 #include <stdlib.h>
 typedef struct { void* ptr; size_t len; } cliproxy_buffer;
-typedef struct { uint32_t abi_version; void* host_ctx; void* call; void* free_buffer; } cliproxy_host_api;
+typedef int (*cliproxy_host_call_fn)(void*, const char*, const uint8_t*, size_t, cliproxy_buffer*);
+typedef void (*cliproxy_host_free_fn)(void*, size_t);
+typedef struct { uint32_t abi_version; void* host_ctx; cliproxy_host_call_fn call; cliproxy_host_free_fn free_buffer; } cliproxy_host_api;
 typedef int (*cliproxy_plugin_call_fn)(char*, uint8_t*, size_t, cliproxy_buffer*);
 typedef void (*cliproxy_plugin_free_fn)(void*, size_t);
 typedef void (*cliproxy_plugin_shutdown_fn)(void);
@@ -12,6 +14,16 @@ typedef struct { uint32_t abi_version; cliproxy_plugin_call_fn call; cliproxy_pl
 extern int cliproxyPluginCall(char*, uint8_t*, size_t, cliproxy_buffer*);
 extern void cliproxyPluginFree(void*, size_t);
 extern void cliproxyPluginShutdown(void);
+
+static const cliproxy_host_api* stored_host;
+static void store_host_api(const cliproxy_host_api* host) { stored_host = host; }
+static int call_host_api(const char* method, const uint8_t* request, size_t request_len, cliproxy_buffer* response) {
+	if (stored_host == NULL || stored_host->call == NULL) return 1;
+	return stored_host->call(stored_host->host_ctx, method, request, request_len, response);
+}
+static void free_host_buffer(void* ptr, size_t len) {
+	if (stored_host != NULL && stored_host->free_buffer != NULL && ptr != NULL) stored_host->free_buffer(ptr, len);
+}
 */
 import "C"
 
@@ -104,6 +116,67 @@ const (
 
 type managementHandler struct{}
 
+type hostAuthListResponse struct {
+	Files []pluginapi.HostAuthFileEntry `json:"files"`
+}
+
+// hostAuthMetadata uses CPA's stock host.auth.list callback. The callback only
+// exposes redacted auth metadata (ID/name/email); credential JSON is never
+// requested, retained, or included in management responses.
+func hostAuthMetadata() (map[string]pluginapi.HostAuthFileEntry, error) {
+	method := C.CString(pluginabi.MethodHostAuthList)
+	defer C.free(unsafe.Pointer(method))
+	payload := []byte(`{}`)
+	payloadPtr := C.CBytes(payload)
+	if payloadPtr == nil {
+		return nil, errors.New("allocate host auth list request")
+	}
+	defer C.free(payloadPtr)
+	var response C.cliproxy_buffer
+	callCode := C.call_host_api(method, (*C.uint8_t)(payloadPtr), C.size_t(len(payload)), &response)
+	if response.ptr == nil || response.len == 0 {
+		return nil, fmt.Errorf("host auth list unavailable (code=%d)", int(callCode))
+	}
+	defer C.free_host_buffer(response.ptr, response.len)
+	raw := C.GoBytes(response.ptr, C.int(response.len))
+	var env envelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return nil, fmt.Errorf("decode host auth list response: %w", err)
+	}
+	if !env.OK {
+		if env.Error != nil {
+			return nil, fmt.Errorf("host auth list: %s", env.Error.Message)
+		}
+		return nil, errors.New("host auth list failed")
+	}
+	var listed hostAuthListResponse
+	if err := json.Unmarshal(env.Result, &listed); err != nil {
+		return nil, fmt.Errorf("decode host auth metadata: %w", err)
+	}
+	byKey := make(map[string]pluginapi.HostAuthFileEntry, len(listed.Files))
+	for _, entry := range listed.Files {
+		id := canonicalAuthID(entry.ID)
+		if id == "" {
+			continue
+		}
+		byKey[accountKey("cpa", id)] = entry
+	}
+	return byKey, nil
+}
+
+func accountLabel(key string, metadata map[string]pluginapi.HostAuthFileEntry) string {
+	entry, ok := metadata[key]
+	if ok {
+		if email := strings.TrimSpace(entry.Email); email != "" {
+			return email
+		}
+		if name := strings.TrimSpace(entry.Name); name != "" {
+			return name
+		}
+	}
+	return key
+}
+
 func managementRegistrationResponse() managementRegistrationPayload {
 	return managementRegistrationPayload{
 		Routes:    []pluginapi.ManagementRoute{{Method: http.MethodGet, Path: managementUsagePath}},
@@ -148,6 +221,10 @@ func readConcurrencySnapshot(ctx context.Context) concurrencySnapshot {
 		}
 		s.InFlight, s.WarmInFlight, s.AccountsInUse = u.InFlight, u.WarmFlight, accounts
 		if listed, listErr := local.AccountSnapshots(ctx, cfg.MaxConcurrency, cfg.WarmReservedSlots); listErr == nil {
+			metadata, _ := hostAuthMetadata()
+			for i := range listed {
+				listed[i].Label = accountLabel(listed[i].Key, metadata)
+			}
 			s.Accounts = listed
 		}
 	} else {
@@ -166,12 +243,10 @@ func readConcurrencySnapshot(ctx context.Context) concurrencySnapshot {
 	return s
 }
 
-// managementHTMLAuthenticated is intentionally a static, unauthenticated resource.
-// The management key is entered by the operator at runtime, retained only in the
-// page's volatile JavaScript closure, and sent solely as an Authorization header
-// to the host-authenticated read-only usage route. It is never part of page source,
-// a URL, browser storage, logs, or rendered error text.
-const managementHTMLAuthenticated = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>CPA concurrency</title><style>body{font:16px system-ui,sans-serif;max-width:760px;margin:2rem auto;padding:0 1rem;color:#17202a}h1{font-size:1.5rem}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1rem}.metric{border:1px solid #b8c2cc;border-radius:6px;padding:1rem}.value{font-size:1.6rem;font-weight:650;margin-top:.25rem}.label{font-size:.85rem;color:#4b5563}#state{margin:1rem 0;padding:.75rem;border-left:4px solid #4b5563;background:#f3f4f6}button{padding:.5rem .75rem;font:inherit}#auth{display:flex;gap:.5rem;align-items:center;flex-wrap:wrap}#management-key{min-width:20rem;padding:.5rem;font:inherit}table{width:100%;border-collapse:collapse;margin-top:1.25rem}th,td{text-align:left;border-bottom:1px solid #d1d5db;padding:.5rem;font-variant-numeric:tabular-nums}</style></head><body><h1>CPA account concurrency</h1><form id="auth"><label for="management-key">Management key</label><input id="management-key" type="password" autocomplete="off" spellcheck="false"><button type="submit">Connect</button></form><p><button id="refresh" type="button">Refresh now</button> <span id="updated" aria-live="polite"></span></p><div id="state" role="status" aria-live="polite">Enter a management key to load live usage.</div><div class="grid" id="metrics"></div><table><caption>Active redacted account buckets</caption><thead><tr><th scope="col">Account key</th><th scope="col">In flight</th><th scope="col">Warm</th><th scope="col">Available</th></tr></thead><tbody id="accounts"></tbody></table><script>(function(){const api='/v0/management/plugins/cpa-account-concurrency/usage';const state=document.getElementById('state'),metrics=document.getElementById('metrics'),accounts=document.getElementById('accounts'),updated=document.getElementById('updated'),keyInput=document.getElementById('management-key'),authForm=document.getElementById('auth');let managementKey='';function render(d){const labels=[['Configured limit','configured_limit'],['Warm reserved','warm_reserved'],['In flight','in_flight'],['Warm in flight','warm_in_flight'],['General in flight','general_in_flight'],['Available capacity','available_capacity']];metrics.innerHTML=labels.map(x=>'<div class="metric"><div class="label">'+x[0]+'</div><div class="value">'+(d[x[1]]??'--')+'</div></div>').join('');accounts.innerHTML=(d.accounts||[]).map(a=>'<tr><td><code>'+a.key+'</code></td><td>'+a.in_flight+'</td><td>'+a.warm_flight+'</td><td>'+Math.max(0,a.limit-a.in_flight)+'</td></tr>').join('');let msg='Authority: '+(d.authority_state||'unknown')+'; capacity: '+(d.capacity_state||'unknown');if(d.empty)msg+='; no active accounts';if(d.stale)msg+='; stale';if(d.error)msg+='; '+d.error;state.textContent=msg;updated.textContent=d.last_refresh?'Last refresh '+new Date(d.last_refresh).toLocaleTimeString():''}async function load(){if(!managementKey){state.textContent='Enter a management key to load live usage.';return}state.textContent='Loading live usage...';try{const r=await fetch(api,{method:'GET',headers:{Authorization:'Bearer '+managementKey},credentials:'same-origin',cache:'no-store'});if(!r.ok){if(r.status===401||r.status===403){managementKey='';state.textContent='Management authentication required.'}else{state.textContent='Unable to load live usage.'}metrics.innerHTML='';accounts.innerHTML='';return}render(await r.json())}catch(_){state.textContent='Unable to load live usage.';metrics.innerHTML='';accounts.innerHTML=''}}authForm.addEventListener('submit',function(event){event.preventDefault();managementKey=keyInput.value;keyInput.value='';load()});document.getElementById('refresh').onclick=load;setInterval(load,5000)})()</script></body></html>`
+// managementHTMLAuthenticated is a static resource. Live data is fetched from
+// the host management route so CPA's existing browser authentication context
+// applies; the plugin has no management-key or duplicate credential flow.
+const managementHTMLAuthenticated = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>CPA concurrency</title><style>body{font:16px system-ui,sans-serif;max-width:760px;margin:2rem auto;padding:0 1rem;color:#17202a}h1{font-size:1.5rem}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1rem}.metric{border:1px solid #b8c2cc;border-radius:6px;padding:1rem}.value{font-size:1.6rem;font-weight:650;margin-top:.25rem}.label{font-size:.85rem;color:#4b5563}#state{margin:1rem 0;padding:.75rem;border-left:4px solid #4b5563;background:#f3f4f6}button{padding:.5rem .75rem;font:inherit}table{width:100%;border-collapse:collapse;margin-top:1.25rem}th,td{text-align:left;border-bottom:1px solid #d1d5db;padding:.5rem;font-variant-numeric:tabular-nums}</style></head><body><h1>CPA account concurrency</h1><p><button id="refresh" type="button">Refresh now</button> <span id="updated" aria-live="polite"></span></p><div id="state" role="status" aria-live="polite">Loading live usage...</div><div class="grid" id="metrics"></div><table><caption>Active CPA accounts</caption><thead><tr><th scope="col">Account</th><th scope="col">Concurrency</th><th scope="col">Warm</th><th scope="col">Available</th></tr></thead><tbody id="accounts"></tbody></table><script>(function(){const api='/v0/management/plugins/cpa-account-concurrency/usage',authFiles='/v0/management/auth-files';const state=document.getElementById('state'),metrics=document.getElementById('metrics'),accounts=document.getElementById('accounts'),updated=document.getElementById('updated');const esc=v=>String(v??'').replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[c]));function render(d){const labels=[['Configured limit','configured_limit'],['Warm reserved','warm_reserved'],['In flight','in_flight'],['Warm in flight','warm_in_flight'],['General in flight','general_in_flight'],['Available capacity','available_capacity']];metrics.innerHTML=labels.map(x=>'<div class="metric"><div class="label">'+x[0]+'</div><div class="value">'+(d[x[1]]??'--')+'</div></div>').join('');accounts.innerHTML=(d.accounts||[]).map(a=>'<tr><td>'+esc(a.label||a.key)+'</td><td>'+a.in_flight+' / '+a.limit+'</td><td>'+a.warm_flight+'</td><td>'+Math.max(0,a.limit-a.in_flight)+'</td></tr>').join('');let msg='Authority: '+(d.authority_state||'unknown')+'; capacity: '+(d.capacity_state||'unknown');if(d.empty)msg+='; no active accounts';if(d.stale)msg+='; stale';if(d.error)msg+='; '+d.error;state.textContent=msg;updated.textContent=d.last_refresh?'Last refresh '+new Date(d.last_refresh).toLocaleTimeString():''}async function load(){state.textContent='Loading live usage...';try{const responses=await Promise.allSettled([fetch(api,{method:'GET',credentials:'same-origin',cache:'no-store'}),fetch(authFiles,{method:'GET',credentials:'same-origin',cache:'no-store'})]);const r=responses[0].status==='fulfilled'?responses[0].value:null;if(!r){state.textContent='Unable to load live usage.';metrics.innerHTML='';accounts.innerHTML='';return}if(!r.ok){if(r.status===401||r.status===403){state.textContent='Management authentication required.'}else{state.textContent='Unable to load live usage.'}metrics.innerHTML='';accounts.innerHTML='';return}render(await r.json())}catch(_){state.textContent='Unable to load live usage.';metrics.innerHTML='';accounts.innerHTML=''}}document.getElementById('refresh').onclick=load;load();setInterval(load,5000)})()</script></body></html>`
 
 type managementRPCRequest struct {
 	pluginapi.ManagementRequest
@@ -248,10 +323,11 @@ func defaultConfig() pluginConfig {
 func main() {}
 
 //export cliproxy_plugin_init
-func cliproxy_plugin_init(_ *C.cliproxy_host_api, plugin *C.cliproxy_plugin_api) C.int {
+func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_api) C.int {
 	if plugin == nil {
 		return 1
 	}
+	C.store_host_api(host)
 	plugin.abi_version = C.uint32_t(pluginabi.ABIVersion)
 	plugin.call = C.cliproxy_plugin_call_fn(C.cliproxyPluginCall)
 	plugin.free_buffer = C.cliproxy_plugin_free_fn(C.cliproxyPluginFree)

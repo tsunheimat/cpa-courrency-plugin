@@ -131,15 +131,28 @@ func TestManagementUIContainsAuthenticatedRefreshAndFailureStates(t *testing.T) 
 	if strings.Contains(body, `"in_flight":`) || strings.Contains(body, `"accounts_in_use":`) {
 		t.Fatal("unauthenticated resource embeds live allocation values")
 	}
-	for _, want := range []string{"/v0/management/plugins/cpa-account-concurrency/usage", "type=\"password\"", "Authorization:'Bearer '+managementKey", "credentials:'same-origin'", "method:'GET'", "Loading live usage", "Unable to load live usage", "Management authentication required.", "stale", "no active accounts", "aria-live"} {
+	for _, want := range []string{"/v0/management/plugins/cpa-account-concurrency/usage", "/v0/management/auth-files", "credentials:'same-origin'", "method:'GET'", "Loading live usage", "Unable to load live usage", "Management authentication required.", "stale", "no active accounts", "aria-live", "a.in_flight+' / '+a.limit", "a.label||a.key"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("UI missing %q", want)
 		}
 	}
-	for _, forbidden := range []string{"localStorage", "sessionStorage", "?management", "managementKey=\"", "Bearer test-secret"} {
+	for _, forbidden := range []string{"localStorage", "sessionStorage", "?management", "managementKey", "type=\"password\"", "Bearer test-secret"} {
 		if strings.Contains(body, forbidden) {
 			t.Errorf("UI contains forbidden credential material %q", forbidden)
 		}
+	}
+}
+
+func TestAccountLabelPrecedence(t *testing.T) {
+	key := "account-hash"
+	if got := accountLabel(key, map[string]pluginapi.HostAuthFileEntry{key: {Email: "user@example.com", Name: "account.json"}}); got != "user@example.com" {
+		t.Fatalf("email label = %q", got)
+	}
+	if got := accountLabel(key, map[string]pluginapi.HostAuthFileEntry{key: {Name: "account.json"}}); got != "account.json" {
+		t.Fatalf("name label = %q", got)
+	}
+	if got := accountLabel(key, nil); got != key {
+		t.Fatalf("hash fallback label = %q", got)
 	}
 }
 
