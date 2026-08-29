@@ -17,6 +17,7 @@ extern void cliproxyPluginShutdown(void);
 
 static const cliproxy_host_api* stored_host;
 static void store_host_api(const cliproxy_host_api* host) { stored_host = host; }
+static void clear_host_api(void) { stored_host = NULL; }
 static int call_host_api(const char* method, const uint8_t* request, size_t request_len, cliproxy_buffer* response) {
 	if (stored_host == NULL || stored_host->call == NULL) return 1;
 	return stored_host->call(stored_host->host_ctx, method, request, request_len, response);
@@ -126,8 +127,11 @@ type hostAuthListCallResult struct {
 }
 
 type hostAuthListCallState struct {
-	mu       sync.Mutex
-	inFlight bool
+	mu            sync.Mutex
+	inFlight      bool
+	activeWorkers int
+	done          chan struct{}
+	retiring      bool
 }
 
 var (
@@ -162,18 +166,41 @@ func invokeHostAuthList() hostAuthListCallResult {
 // requested, retained, or included in management responses.
 func hostAuthMetadata() (map[string]pluginapi.HostAuthFileEntry, error) {
 	hostAuthCallState.mu.Lock()
-	if hostAuthCallState.inFlight {
+	if hostAuthCallState.inFlight || hostAuthCallState.retiring {
 		hostAuthCallState.mu.Unlock()
 		return nil, errors.New("host auth list callback still pending")
 	}
 	hostAuthCallState.inFlight = true
+	hostAuthCallState.activeWorkers++
+	workerDone := make(chan struct{})
+	hostAuthCallState.done = workerDone
 	hostAuthCallState.mu.Unlock()
 
 	done := make(chan hostAuthListCallResult, 1)
 	go func() {
-		result := hostAuthInvoker()
+		hostAuthCallState.mu.Lock()
+		if hostAuthCallState.retiring {
+			hostAuthCallState.inFlight = false
+			hostAuthCallState.activeWorkers--
+			if hostAuthCallState.done == workerDone {
+				hostAuthCallState.done = nil
+			}
+			close(workerDone)
+			hostAuthCallState.mu.Unlock()
+			done <- hostAuthListCallResult{code: -1}
+			return
+		}
+		invoker := hostAuthInvoker
+		hostAuthCallState.mu.Unlock()
+
+		result := invoker()
 		hostAuthCallState.mu.Lock()
 		hostAuthCallState.inFlight = false
+		hostAuthCallState.activeWorkers--
+		if hostAuthCallState.done == workerDone {
+			hostAuthCallState.done = nil
+		}
+		close(workerDone)
 		hostAuthCallState.mu.Unlock()
 		done <- result
 	}()
@@ -223,6 +250,25 @@ func hostAuthMetadata() (map[string]pluginapi.HostAuthFileEntry, error) {
 		return nil, errors.New("host auth list returned no usable entries")
 	}
 	return byKey, nil
+}
+
+// retireHostAuthWorker fences new host callbacks and joins the sole callback
+// worker. The management timeout remains bounded; lifecycle transitions wait
+// for a timed-out callback before CPA can release the host API or unload us.
+func retireHostAuthWorker() {
+	hostAuthCallState.mu.Lock()
+	hostAuthCallState.retiring = true
+	workerDone := hostAuthCallState.done
+	hostAuthCallState.mu.Unlock()
+	if workerDone != nil {
+		<-workerDone
+	}
+}
+
+func resumeHostAuthWorker() {
+	hostAuthCallState.mu.Lock()
+	hostAuthCallState.retiring = false
+	hostAuthCallState.mu.Unlock()
 }
 
 func accountLabel(key string, metadata map[string]pluginapi.HostAuthFileEntry) string {
@@ -395,7 +441,11 @@ func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_a
 	if plugin == nil {
 		return 1
 	}
+	state.gate.Lock()
+	defer state.gate.Unlock()
+	retireHostAuthWorker()
 	C.store_host_api(host)
+	resumeHostAuthWorker()
 	plugin.abi_version = C.uint32_t(pluginabi.ABIVersion)
 	plugin.call = C.cliproxy_plugin_call_fn(C.cliproxyPluginCall)
 	plugin.free_buffer = C.cliproxy_plugin_free_fn(C.cliproxyPluginFree)
@@ -442,6 +492,8 @@ func cliproxyPluginFree(ptr unsafe.Pointer, _ C.size_t) {
 func cliproxyPluginShutdown() {
 	state.gate.Lock()
 	defer state.gate.Unlock()
+	retireHostAuthWorker()
+	defer C.clear_host_api()
 	state.mu.Lock()
 	leases := make([]Lease, 0, len(state.leases))
 	for _, lease := range state.leases {
@@ -555,6 +607,8 @@ func quiesce(raw []byte) error {
 func configure(raw []byte) error {
 	state.gate.Lock()
 	defer state.gate.Unlock()
+	retireHostAuthWorker()
+	defer resumeHostAuthWorker()
 	var req lifecycleRequest
 	if len(raw) > 0 {
 		if err := json.Unmarshal(raw, &req); err != nil {

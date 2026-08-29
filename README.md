@@ -53,10 +53,12 @@ shows its own `in_flight / limit` value (for example, `1 / 2`). The callback is
 bounded; timeout, callback error, malformed data, or an empty/unusable list
 leaves usage counts available, marks the snapshot stale with an
 `account labels unavailable` error, and uses the hashed key as the truthful
-label fallback. This enrichment path never participates in admission. The
-plugin never requests or stores auth JSON, tokens, passwords, or a
-plugin-specific management key, and the browser makes no separate auth-files
-request.
+label fallback. This enrichment path never participates in admission. A
+timed-out callback remains the single in-flight worker; shutdown, reload, and
+reinitialization fence and join it before the host API is released or the
+plugin can be unloaded. The plugin never requests or stores auth JSON, tokens,
+passwords, or a plugin-specific management key, and the browser makes no
+separate auth-files request.
 
 ## Authority modes
 

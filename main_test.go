@@ -26,6 +26,12 @@ type testRequestInterceptRequest struct {
 }
 
 func resetTestState() {
+	hostAuthCallState.mu.Lock()
+	hostAuthCallState.retiring = false
+	hostAuthCallState.inFlight = false
+	hostAuthCallState.activeWorkers = 0
+	hostAuthCallState.done = nil
+	hostAuthCallState.mu.Unlock()
 	state.gate.Lock()
 	defer state.gate.Unlock()
 	state.mu.Lock()
@@ -224,6 +230,148 @@ func TestHostAuthMetadataFailuresAreBoundedAndRedacted(t *testing.T) {
 			break
 		}
 		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestHostAuthTimeoutIsJoinedBeforeLifecycleReturns(t *testing.T) {
+	oldInvoker, oldTimeout := hostAuthInvoker, hostAuthTimeout
+	t.Cleanup(func() {
+		hostAuthInvoker, hostAuthTimeout = oldInvoker, oldTimeout
+		resetTestState()
+	})
+	hostAuthTimeout = 5 * time.Millisecond
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var mu sync.Mutex
+	active, maxActive, calls := 0, 0, 0
+	lifetimeEnded := false
+	hostAuthInvoker = func() hostAuthListCallResult {
+		mu.Lock()
+		active++
+		calls++
+		if active > maxActive {
+			maxActive = active
+		}
+		mu.Unlock()
+		close(started)
+		<-release
+		mu.Lock()
+		if lifetimeEnded {
+			t.Errorf("host callback accessed state after plugin lifetime ended")
+		}
+		active--
+		mu.Unlock()
+		return hostAuthListCallResult{code: 7}
+	}
+	result := make(chan error, 1)
+	go func() {
+		_, err := hostAuthMetadata()
+		result <- err
+	}()
+	<-started
+	select {
+	case err := <-result:
+		if err == nil || !strings.Contains(err.Error(), "timed out") {
+			t.Fatalf("timeout result = %v", err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("host metadata did not honor timeout")
+	}
+	joined := make(chan struct{})
+	go func() {
+		cliproxyPluginShutdown()
+		mu.Lock()
+		lifetimeEnded = true
+		mu.Unlock()
+		close(joined)
+	}()
+	select {
+	case <-joined:
+		t.Fatal("shutdown returned while timed-out host callback was still running")
+	case <-time.After(20 * time.Millisecond):
+	}
+	mu.Lock()
+	if calls != 1 || maxActive != 1 || active != 1 {
+		t.Fatalf("worker state before release: calls=%d max=%d active=%d", calls, maxActive, active)
+	}
+	mu.Unlock()
+	if _, err := hostAuthMetadata(); err == nil || !strings.Contains(err.Error(), "still pending") {
+		t.Fatalf("second metadata lookup while worker pending: %v", err)
+	}
+	mu.Lock()
+	if calls != 1 || maxActive != 1 {
+		t.Fatalf("second lookup accumulated a worker: calls=%d max=%d", calls, maxActive)
+	}
+	mu.Unlock()
+	close(release)
+	select {
+	case <-joined:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("shutdown did not join timed-out host callback")
+	}
+	mu.Lock()
+	if active != 0 || maxActive != 1 {
+		t.Fatalf("worker state after shutdown: max=%d active=%d", maxActive, active)
+	}
+	mu.Unlock()
+	hostAuthCallState.mu.Lock()
+	if hostAuthCallState.activeWorkers != 0 || hostAuthCallState.done != nil {
+		hostAuthCallState.mu.Unlock()
+		t.Fatalf("tracked workers after shutdown: active=%d done=%v", hostAuthCallState.activeWorkers, hostAuthCallState.done != nil)
+	}
+	hostAuthCallState.mu.Unlock()
+	if _, err := hostAuthMetadata(); err == nil {
+		t.Fatal("host callback started after shutdown lifetime fence")
+	}
+	mu.Lock()
+	if calls != 1 {
+		t.Fatalf("post-shutdown callback count = %d, want 1", calls)
+	}
+	mu.Unlock()
+
+	// Reconfigure is also a lifetime boundary: it must join a prior worker
+	// before returning and then permit one fresh callback after the fence lifts.
+	resetTestState()
+	started = make(chan struct{})
+	release = make(chan struct{})
+	hostAuthTimeout = 5 * time.Millisecond
+	hostAuthInvoker = func() hostAuthListCallResult {
+		close(started)
+		<-release
+		return hostAuthListCallResult{code: 7}
+	}
+	metadataDone := make(chan struct{})
+	go func() {
+		_, _ = hostAuthMetadata()
+		close(metadataDone)
+	}()
+	<-started
+	time.Sleep(10 * time.Millisecond)
+	config, _ := json.Marshal(lifecycleRequest{SchemaVersion: 4, ConfigYAML: []byte("authority: local\n")})
+	configured := make(chan error, 1)
+	go func() { configured <- configure(config) }()
+	select {
+	case err := <-configured:
+		t.Fatalf("reconfigure returned before worker joined: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case err := <-configured:
+		if err != nil {
+			t.Fatalf("reconfigure error = %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("reconfigure did not join timed-out host callback")
+	}
+	select {
+	case <-metadataDone:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("host metadata wrapper did not finish after worker join")
+	}
+	hostAuthInvoker = func() hostAuthListCallResult { return hostAuthListCallResult{code: 7} }
+	if _, err := hostAuthMetadata(); err == nil {
+		t.Fatal("host callback remained permanently fenced after reconfigure")
 	}
 }
 

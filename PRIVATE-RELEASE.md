@@ -24,6 +24,8 @@ Version `0.1.3` includes the bounded stock CPA auth metadata observability repai
 from commit `6d0c24c2dfc9c153cba747456197dc96f13ad7c4`: management label lookup
 times out and falls back to hashed keys without affecting admission, and disk
 fallback entries map through their auth JSON filename when no ID is supplied.
+Timed-out metadata workers remain single-flight and are fenced and joined by
+shutdown, reload, and reinitialization before the host API can be released.
 It also removes the browser-side `/v0/management/auth-files` fetch. Version
 `0.1.3` retains the stock CPA compatibility repair from commit
 `198e407979e55ef30bd33b61a99a53c430e9878d`: the plugin resolves the selected
