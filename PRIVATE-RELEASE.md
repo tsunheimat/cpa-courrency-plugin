@@ -13,12 +13,20 @@ management/environment; no token belongs in this repository or in the registry.
 
 ## Release asset contract
 
-For version `0.1.1`, publish these assets on GitHub Release tag `v0.1.1`:
+For version `0.1.2`, publish these assets on GitHub Release tag `v0.1.2`:
 
 ```text
-cpa-account-concurrency_0.1.1_linux_amd64.zip
+cpa-account-concurrency_0.1.2_linux_amd64.zip
 checksums.txt
 ```
+
+Version `0.1.2` includes the stock CPA compatibility repair from commit
+`198e407979e55ef30bd33b61a99a53c430e9878d`: the plugin resolves the selected
+account from stock CPA `Metadata["selected_auth_id"]` without requiring any
+CPA/CLIProxyAPI host source change. The account-level hard in-flight admission,
+fail-closed identity handling, lifecycle release, authenticated read-only usage
+UI, private registry/store model, and single-CPA `authority: local` configuration
+remain unchanged.
 
 The ZIP must contain the dynamic library at its root using this name:
 
@@ -84,9 +92,9 @@ GOOS=linux GOARCH=amd64 \
   go build -trimpath -buildmode=c-shared \
   -o cpa-account-concurrency.so .
 
-zip -X cpa-account-concurrency_0.1.1_linux_amd64.zip \
+zip -X cpa-account-concurrency_0.1.2_linux_amd64.zip \
   cpa-account-concurrency.so
-sha256sum cpa-account-concurrency_0.1.1_linux_amd64.zip > checksums.txt
+sha256sum cpa-account-concurrency_0.1.2_linux_amd64.zip > checksums.txt
 ```
 
 The checked-in `registry.json` is metadata only; source and release assets are
