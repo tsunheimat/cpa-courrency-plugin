@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "plugins": [
+    {
+      "id": "cpa-account-concurrency",
+      "name": "CPA Account Concurrency",
+      "description": "Cache-aware, per-account hard in-flight concurrency admission for CPA Pro accounts. Prevents upstream calls above the configured account limit and returns typed local capacity errors.",
+      "author": "tokenrouter-tech",
+      "repository": "https://github.com/tokenrouter-tech/cpa-courrency-plugin",
+      "homepage": "https://github.com/tokenrouter-tech/cpa-courrency-plugin",
+      "license": "MIT",
+      "tags": [
+        "cpa",
+        "concurrency",
+        "admission",
+        "prompt-cache",
+        "private"
+      ],
+      "install": {
+        "type": "github-release"
+      },
+      "auth_required": true
+    }
+  ]
+}
