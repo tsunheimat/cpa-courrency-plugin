@@ -66,6 +66,11 @@ plugins:
       redis_prefix: cpa:concurrency
 ```
 
+The same host configuration is also provided as JSON in
+`cpa-private-config.example.json`. CPA parses this JSON through its normal
+configuration parser; set `CPA_PLUGIN_GITHUB_TOKEN` in the CPA service
+environment/secret manager, not in this file.
+
 For multiple CPA processes sharing the same Pro account, use `authority:
 redis` and supply the Redis settings through the plugin configuration/secret
 management. Keep the CPA GitHub token separate from Redis credentials.
