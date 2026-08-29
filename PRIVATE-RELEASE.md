@@ -13,10 +13,10 @@ management/environment; no token belongs in this repository or in the registry.
 
 ## Release asset contract
 
-For version `0.1.0`, publish these assets on GitHub Release tag `v0.1.0`:
+For version `0.1.1`, publish these assets on GitHub Release tag `v0.1.1`:
 
 ```text
-cpa-account-concurrency_0.1.0_linux_amd64.zip
+cpa-account-concurrency_0.1.1_linux_amd64.zip
 checksums.txt
 ```
 
@@ -84,9 +84,9 @@ GOOS=linux GOARCH=amd64 \
   go build -trimpath -buildmode=c-shared \
   -o cpa-account-concurrency.so .
 
-zip -X cpa-account-concurrency_0.1.0_linux_amd64.zip \
+zip -X cpa-account-concurrency_0.1.1_linux_amd64.zip \
   cpa-account-concurrency.so
-sha256sum cpa-account-concurrency_0.1.0_linux_amd64.zip > checksums.txt
+sha256sum cpa-account-concurrency_0.1.1_linux_amd64.zip > checksums.txt
 ```
 
 The checked-in `registry.json` is metadata only; source and release assets are
