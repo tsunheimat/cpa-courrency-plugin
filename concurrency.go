@@ -47,11 +47,11 @@ type Usage struct {
 }
 
 type AccountUsage struct {
-	Key        string
-	Limit      int
-	Reserved   int
-	InFlight   int
-	WarmFlight int
+	Key        string `json:"key"`
+	Limit      int    `json:"limit"`
+	Reserved   int    `json:"reserved"`
+	InFlight   int    `json:"in_flight"`
+	WarmFlight int    `json:"warm_flight"`
 }
 
 // AggregateSnapshot returns process-local usage without exposing authority keys.

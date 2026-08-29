@@ -92,6 +92,21 @@ func TestManagementRegistrationAndLiveSnapshotAreReadOnlyAndRedacted(t *testing.
 	if snapshot.InFlight != 1 || snapshot.ConfiguredLimit != 2 || snapshot.WarmReserved != 1 || snapshot.AvailableCapacity != 1 {
 		t.Fatalf("snapshot = %#v", snapshot)
 	}
+	if len(snapshot.Accounts) != 1 {
+		t.Fatalf("snapshot accounts = %#v, want one active account", snapshot.Accounts)
+	}
+	if got := snapshot.Accounts[0]; got.Key == "" || got.Key == "account-secret@example.com" || got.Limit != 2 || got.Reserved != 1 || got.InFlight != 1 || got.WarmFlight != 0 {
+		t.Fatalf("snapshot account = %#v", got)
+	}
+	serialized, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{`"key"`, `"limit"`, `"reserved"`, `"in_flight"`, `"warm_flight"`} {
+		if !strings.Contains(string(serialized), field) {
+			t.Fatalf("snapshot JSON missing nested field %s: %s", field, serialized)
+		}
+	}
 	if got := len(state.leases); got != before {
 		t.Fatalf("snapshot mutated leases: before=%d after=%d", before, got)
 	}
@@ -106,9 +121,41 @@ func TestManagementUIContainsAuthenticatedRefreshAndFailureStates(t *testing.T) 
 	if strings.Contains(body, `"in_flight":`) || strings.Contains(body, `"accounts_in_use":`) {
 		t.Fatal("unauthenticated resource embeds live allocation values")
 	}
-	for _, want := range []string{"/v0/management/plugins/cpa-account-concurrency/usage", "credentials:'same-origin'", "Loading live usage", "Unable to load live usage", "stale", "no active accounts", "aria-live"} {
+	for _, want := range []string{"/v0/management/plugins/cpa-account-concurrency/usage", "type=\"password\"", "Authorization:'Bearer '+managementKey", "credentials:'same-origin'", "method:'GET'", "Loading live usage", "Unable to load live usage", "Management authentication required.", "stale", "no active accounts", "aria-live"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("UI missing %q", want)
+		}
+	}
+	for _, forbidden := range []string{"localStorage", "sessionStorage", "?management", "managementKey=\"", "Bearer test-secret"} {
+		if strings.Contains(body, forbidden) {
+			t.Errorf("UI contains forbidden credential material %q", forbidden)
+		}
+	}
+}
+
+func TestAccountUsageJSONUsesUIContract(t *testing.T) {
+	account := AccountUsage{Key: "acct-hash", Limit: 4, Reserved: 1, InFlight: 2, WarmFlight: 1}
+	raw, err := json.Marshal(account)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatal(err)
+	}
+	for key, want := range map[string]float64{"key": 0, "limit": 4, "reserved": 1, "in_flight": 2, "warm_flight": 1} {
+		got, ok := fields[key]
+		if !ok {
+			t.Fatalf("serialized AccountUsage missing %q: %s", key, raw)
+		}
+		if key == "key" {
+			if got != "acct-hash" {
+				t.Fatalf("serialized key = %#v", got)
+			}
+			continue
+		}
+		if got != want {
+			t.Fatalf("serialized %s = %#v, want %v", key, got, want)
 		}
 	}
 }
