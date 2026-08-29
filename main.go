@@ -120,27 +120,77 @@ type hostAuthListResponse struct {
 	Files []pluginapi.HostAuthFileEntry `json:"files"`
 }
 
-// hostAuthMetadata uses CPA's stock host.auth.list callback. The callback only
-// exposes redacted auth metadata (ID/name/email); credential JSON is never
-// requested, retained, or included in management responses.
-func hostAuthMetadata() (map[string]pluginapi.HostAuthFileEntry, error) {
+type hostAuthListCallResult struct {
+	raw  []byte
+	code int
+}
+
+type hostAuthListCallState struct {
+	mu       sync.Mutex
+	inFlight bool
+}
+
+var (
+	hostAuthCallState hostAuthListCallState
+	hostAuthInvoker   = invokeHostAuthList
+	hostAuthTimeout   = authorityCallTimeout
+)
+
+// invokeHostAuthList performs the stock callback and copies only its bounded
+// response bytes before returning. The caller runs it in a worker so a host
+// callback that never returns cannot hold a management request open forever.
+func invokeHostAuthList() hostAuthListCallResult {
 	method := C.CString(pluginabi.MethodHostAuthList)
 	defer C.free(unsafe.Pointer(method))
 	payload := []byte(`{}`)
 	payloadPtr := C.CBytes(payload)
 	if payloadPtr == nil {
-		return nil, errors.New("allocate host auth list request")
+		return hostAuthListCallResult{code: -1}
 	}
 	defer C.free(payloadPtr)
 	var response C.cliproxy_buffer
 	callCode := C.call_host_api(method, (*C.uint8_t)(payloadPtr), C.size_t(len(payload)), &response)
 	if response.ptr == nil || response.len == 0 {
-		return nil, fmt.Errorf("host auth list unavailable (code=%d)", int(callCode))
+		return hostAuthListCallResult{code: int(callCode)}
 	}
 	defer C.free_host_buffer(response.ptr, response.len)
-	raw := C.GoBytes(response.ptr, C.int(response.len))
+	return hostAuthListCallResult{raw: C.GoBytes(response.ptr, C.int(response.len)), code: int(callCode)}
+}
+
+// hostAuthMetadata uses CPA's stock host.auth.list callback. The callback only
+// exposes redacted auth metadata (ID/name/email); credential JSON is never
+// requested, retained, or included in management responses.
+func hostAuthMetadata() (map[string]pluginapi.HostAuthFileEntry, error) {
+	hostAuthCallState.mu.Lock()
+	if hostAuthCallState.inFlight {
+		hostAuthCallState.mu.Unlock()
+		return nil, errors.New("host auth list callback still pending")
+	}
+	hostAuthCallState.inFlight = true
+	hostAuthCallState.mu.Unlock()
+
+	done := make(chan hostAuthListCallResult, 1)
+	go func() {
+		result := hostAuthInvoker()
+		hostAuthCallState.mu.Lock()
+		hostAuthCallState.inFlight = false
+		hostAuthCallState.mu.Unlock()
+		done <- result
+	}()
+	var result hostAuthListCallResult
+	select {
+	case result = <-done:
+	case <-time.After(hostAuthTimeout):
+		return nil, errors.New("host auth list callback timed out")
+	}
+	if result.code != 0 {
+		return nil, fmt.Errorf("host auth list callback failed (code=%d)", result.code)
+	}
+	if len(result.raw) == 0 {
+		return nil, errors.New("host auth list unavailable")
+	}
 	var env envelope
-	if err := json.Unmarshal(raw, &env); err != nil {
+	if err := json.Unmarshal(result.raw, &env); err != nil {
 		return nil, fmt.Errorf("decode host auth list response: %w", err)
 	}
 	if !env.OK {
@@ -153,13 +203,24 @@ func hostAuthMetadata() (map[string]pluginapi.HostAuthFileEntry, error) {
 	if err := json.Unmarshal(env.Result, &listed); err != nil {
 		return nil, fmt.Errorf("decode host auth metadata: %w", err)
 	}
+	if len(listed.Files) == 0 {
+		return nil, errors.New("host auth list returned no entries")
+	}
 	byKey := make(map[string]pluginapi.HostAuthFileEntry, len(listed.Files))
 	for _, entry := range listed.Files {
 		id := canonicalAuthID(entry.ID)
 		if id == "" {
+			// CPA's stock disk fallback has no runtime ID; its Name is the
+			// auth JSON filename and is the stable identity in that mode.
+			id = canonicalAuthID(entry.Name)
+		}
+		if id == "" {
 			continue
 		}
 		byKey[accountKey("cpa", id)] = entry
+	}
+	if len(byKey) == 0 {
+		return nil, errors.New("host auth list returned no usable entries")
 	}
 	return byKey, nil
 }
@@ -221,9 +282,16 @@ func readConcurrencySnapshot(ctx context.Context) concurrencySnapshot {
 		}
 		s.InFlight, s.WarmInFlight, s.AccountsInUse = u.InFlight, u.WarmFlight, accounts
 		if listed, listErr := local.AccountSnapshots(ctx, cfg.MaxConcurrency, cfg.WarmReservedSlots); listErr == nil {
-			metadata, _ := hostAuthMetadata()
-			for i := range listed {
-				listed[i].Label = accountLabel(listed[i].Key, metadata)
+			if len(listed) > 0 {
+				metadata, metadataErr := hostAuthMetadata()
+				if metadataErr != nil {
+					// Usage remains truthful; only labels fall back to hashed keys.
+					s.Stale = true
+					s.Error = "account labels unavailable"
+				}
+				for i := range listed {
+					listed[i].Label = accountLabel(listed[i].Key, metadata)
+				}
 			}
 			s.Accounts = listed
 		}
@@ -246,7 +314,7 @@ func readConcurrencySnapshot(ctx context.Context) concurrencySnapshot {
 // managementHTMLAuthenticated is a static resource. Live data is fetched from
 // the host management route so CPA's existing browser authentication context
 // applies; the plugin has no management-key or duplicate credential flow.
-const managementHTMLAuthenticated = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>CPA concurrency</title><style>body{font:16px system-ui,sans-serif;max-width:760px;margin:2rem auto;padding:0 1rem;color:#17202a}h1{font-size:1.5rem}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1rem}.metric{border:1px solid #b8c2cc;border-radius:6px;padding:1rem}.value{font-size:1.6rem;font-weight:650;margin-top:.25rem}.label{font-size:.85rem;color:#4b5563}#state{margin:1rem 0;padding:.75rem;border-left:4px solid #4b5563;background:#f3f4f6}button{padding:.5rem .75rem;font:inherit}table{width:100%;border-collapse:collapse;margin-top:1.25rem}th,td{text-align:left;border-bottom:1px solid #d1d5db;padding:.5rem;font-variant-numeric:tabular-nums}</style></head><body><h1>CPA account concurrency</h1><p><button id="refresh" type="button">Refresh now</button> <span id="updated" aria-live="polite"></span></p><div id="state" role="status" aria-live="polite">Loading live usage...</div><div class="grid" id="metrics"></div><table><caption>Active CPA accounts</caption><thead><tr><th scope="col">Account</th><th scope="col">Concurrency</th><th scope="col">Warm</th><th scope="col">Available</th></tr></thead><tbody id="accounts"></tbody></table><script>(function(){const api='/v0/management/plugins/cpa-account-concurrency/usage',authFiles='/v0/management/auth-files';const state=document.getElementById('state'),metrics=document.getElementById('metrics'),accounts=document.getElementById('accounts'),updated=document.getElementById('updated');const esc=v=>String(v??'').replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[c]));function render(d){const labels=[['Configured limit','configured_limit'],['Warm reserved','warm_reserved'],['In flight','in_flight'],['Warm in flight','warm_in_flight'],['General in flight','general_in_flight'],['Available capacity','available_capacity']];metrics.innerHTML=labels.map(x=>'<div class="metric"><div class="label">'+x[0]+'</div><div class="value">'+(d[x[1]]??'--')+'</div></div>').join('');accounts.innerHTML=(d.accounts||[]).map(a=>'<tr><td>'+esc(a.label||a.key)+'</td><td>'+a.in_flight+' / '+a.limit+'</td><td>'+a.warm_flight+'</td><td>'+Math.max(0,a.limit-a.in_flight)+'</td></tr>').join('');let msg='Authority: '+(d.authority_state||'unknown')+'; capacity: '+(d.capacity_state||'unknown');if(d.empty)msg+='; no active accounts';if(d.stale)msg+='; stale';if(d.error)msg+='; '+d.error;state.textContent=msg;updated.textContent=d.last_refresh?'Last refresh '+new Date(d.last_refresh).toLocaleTimeString():''}async function load(){state.textContent='Loading live usage...';try{const responses=await Promise.allSettled([fetch(api,{method:'GET',credentials:'same-origin',cache:'no-store'}),fetch(authFiles,{method:'GET',credentials:'same-origin',cache:'no-store'})]);const r=responses[0].status==='fulfilled'?responses[0].value:null;if(!r){state.textContent='Unable to load live usage.';metrics.innerHTML='';accounts.innerHTML='';return}if(!r.ok){if(r.status===401||r.status===403){state.textContent='Management authentication required.'}else{state.textContent='Unable to load live usage.'}metrics.innerHTML='';accounts.innerHTML='';return}render(await r.json())}catch(_){state.textContent='Unable to load live usage.';metrics.innerHTML='';accounts.innerHTML=''}}document.getElementById('refresh').onclick=load;load();setInterval(load,5000)})()</script></body></html>`
+const managementHTMLAuthenticated = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>CPA concurrency</title><style>body{font:16px system-ui,sans-serif;max-width:760px;margin:2rem auto;padding:0 1rem;color:#17202a}h1{font-size:1.5rem}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1rem}.metric{border:1px solid #b8c2cc;border-radius:6px;padding:1rem}.value{font-size:1.6rem;font-weight:650;margin-top:.25rem}.label{font-size:.85rem;color:#4b5563}#state{margin:1rem 0;padding:.75rem;border-left:4px solid #4b5563;background:#f3f4f6}button{padding:.5rem .75rem;font:inherit}table{width:100%;border-collapse:collapse;margin-top:1.25rem}th,td{text-align:left;border-bottom:1px solid #d1d5db;padding:.5rem;font-variant-numeric:tabular-nums}</style></head><body><h1>CPA account concurrency</h1><p><button id="refresh" type="button">Refresh now</button> <span id="updated" aria-live="polite"></span></p><div id="state" role="status" aria-live="polite">Loading live usage...</div><div class="grid" id="metrics"></div><table><caption>Active CPA accounts</caption><thead><tr><th scope="col">Account</th><th scope="col">Concurrency</th><th scope="col">Warm</th><th scope="col">Available</th></tr></thead><tbody id="accounts"></tbody></table><script>(function(){const api='/v0/management/plugins/cpa-account-concurrency/usage';const state=document.getElementById('state'),metrics=document.getElementById('metrics'),accounts=document.getElementById('accounts'),updated=document.getElementById('updated');const esc=v=>String(v??'').replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[c]));function render(d){const labels=[['Configured limit','configured_limit'],['Warm reserved','warm_reserved'],['In flight','in_flight'],['Warm in flight','warm_in_flight'],['General in flight','general_in_flight'],['Available capacity','available_capacity']];metrics.innerHTML=labels.map(x=>'<div class="metric"><div class="label">'+x[0]+'</div><div class="value">'+(d[x[1]]??'--')+'</div></div>').join('');accounts.innerHTML=(d.accounts||[]).map(a=>'<tr><td>'+esc(a.label||a.key)+'</td><td>'+a.in_flight+' / '+a.limit+'</td><td>'+a.warm_flight+'</td><td>'+Math.max(0,a.limit-a.in_flight)+'</td></tr>').join('');let msg='Authority: '+(d.authority_state||'unknown')+'; capacity: '+(d.capacity_state||'unknown');if(d.empty)msg+='; no active accounts';if(d.stale)msg+='; stale';if(d.error)msg+='; '+d.error;state.textContent=msg;updated.textContent=d.last_refresh?'Last refresh '+new Date(d.last_refresh).toLocaleTimeString():''}async function load(){state.textContent='Loading live usage...';try{const r=await fetch(api,{method:'GET',credentials:'same-origin',cache:'no-store'});if(!r.ok){if(r.status===401||r.status===403){state.textContent='Management authentication required.'}else{state.textContent='Unable to load live usage.'}metrics.innerHTML='';accounts.innerHTML='';return}render(await r.json())}catch(_){state.textContent='Unable to load live usage.';metrics.innerHTML='';accounts.innerHTML=''}}document.getElementById('refresh').onclick=load;load();setInterval(load,5000)})()</script></body></html>`
 
 type managementRPCRequest struct {
 	pluginapi.ManagementRequest
@@ -564,7 +632,7 @@ func configure(raw []byte) error {
 }
 
 func pluginRegistration() registration {
-	return registration{SchemaVersion: pluginabi.SchemaVersion, Metadata: pluginapi.Metadata{Name: pluginID, Version: "0.1.2", Author: "CPA concurrency plugin", GitHubRepository: "https://github.com/router-for-me/CLIProxyAPI", ConfigFields: []pluginapi.ConfigField{
+	return registration{SchemaVersion: pluginabi.SchemaVersion, Metadata: pluginapi.Metadata{Name: pluginID, Version: "0.1.3", Author: "CPA concurrency plugin", GitHubRepository: "https://github.com/router-for-me/CLIProxyAPI", ConfigFields: []pluginapi.ConfigField{
 		{Name: "max_concurrency", Type: pluginapi.ConfigFieldTypeInteger, Description: "Hard per-account in-flight limit."},
 		{Name: "warm_reserved_slots", Type: pluginapi.ConfigFieldTypeInteger, Description: "Reserved slots for verified warm/strict affinity."},
 		{Name: "wait_timeout", Type: pluginapi.ConfigFieldTypeString, Description: "Bounded admission wait (Go duration, for example 50ms)."},

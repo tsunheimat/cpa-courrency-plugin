@@ -49,9 +49,14 @@ The CPA concurrency management view reads the existing authenticated
 stock `host.auth.list` callback to enrich each hashed usage bucket with redacted
 account metadata. Labels prefer the auth email, then the CPA auth JSON
 filename/name, and finally the existing hashed account key. Each active account
-shows its own `in_flight / limit` value (for example, `1 / 2`). The plugin never
-requests or stores auth JSON, tokens, passwords, or a plugin-specific
-management key.
+shows its own `in_flight / limit` value (for example, `1 / 2`). The callback is
+bounded; timeout, callback error, malformed data, or an empty/unusable list
+leaves usage counts available, marks the snapshot stale with an
+`account labels unavailable` error, and uses the hashed key as the truthful
+label fallback. This enrichment path never participates in admission. The
+plugin never requests or stores auth JSON, tokens, passwords, or a
+plugin-specific management key, and the browser makes no separate auth-files
+request.
 
 ## Authority modes
 

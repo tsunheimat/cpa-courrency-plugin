@@ -57,7 +57,7 @@ func TestPluginRegistrationIncludesRequiredRepositoryMetadata(t *testing.T) {
 	if reg.Metadata.GitHubRepository == "" {
 		t.Fatal("plugin registration omitted GitHubRepository")
 	}
-	if reg.Metadata.Name != pluginID || reg.Metadata.Version != "0.1.2" || !reg.Capabilities.Scheduler || !reg.Capabilities.RequestInterceptorEnforcesAdmission {
+	if reg.Metadata.Name != pluginID || reg.Metadata.Version != "0.1.3" || !reg.Capabilities.Scheduler || !reg.Capabilities.RequestInterceptorEnforcesAdmission {
 		t.Fatalf("registration = %#v", reg)
 	}
 	if !reg.Capabilities.ManagementAPI {
@@ -131,12 +131,12 @@ func TestManagementUIContainsAuthenticatedRefreshAndFailureStates(t *testing.T) 
 	if strings.Contains(body, `"in_flight":`) || strings.Contains(body, `"accounts_in_use":`) {
 		t.Fatal("unauthenticated resource embeds live allocation values")
 	}
-	for _, want := range []string{"/v0/management/plugins/cpa-account-concurrency/usage", "/v0/management/auth-files", "credentials:'same-origin'", "method:'GET'", "Loading live usage", "Unable to load live usage", "Management authentication required.", "stale", "no active accounts", "aria-live", "a.in_flight+' / '+a.limit", "a.label||a.key"} {
+	for _, want := range []string{"/v0/management/plugins/cpa-account-concurrency/usage", "credentials:'same-origin'", "method:'GET'", "Loading live usage", "Unable to load live usage", "Management authentication required.", "stale", "no active accounts", "aria-live", "a.in_flight+' / '+a.limit", "a.label||a.key"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("UI missing %q", want)
 		}
 	}
-	for _, forbidden := range []string{"localStorage", "sessionStorage", "?management", "managementKey", "type=\"password\"", "Bearer test-secret"} {
+	for _, forbidden := range []string{"localStorage", "sessionStorage", "?management", "managementKey", "type=\"password\"", "Bearer test-secret", "/v0/management/auth-files"} {
 		if strings.Contains(body, forbidden) {
 			t.Errorf("UI contains forbidden credential material %q", forbidden)
 		}
@@ -154,6 +154,85 @@ func TestAccountLabelPrecedence(t *testing.T) {
 	if got := accountLabel(key, nil); got != key {
 		t.Fatalf("hash fallback label = %q", got)
 	}
+}
+
+func TestHostAuthMetadataUsesIDFirstAndNameFallback(t *testing.T) {
+	oldInvoker, oldTimeout := hostAuthInvoker, hostAuthTimeout
+	t.Cleanup(func() {
+		hostAuthInvoker, hostAuthTimeout = oldInvoker, oldTimeout
+		hostAuthCallState.mu.Lock()
+		hostAuthCallState.inFlight = false
+		hostAuthCallState.mu.Unlock()
+	})
+	entryID := pluginapi.HostAuthFileEntry{ID: "runtime-id", Name: "runtime.json", Email: "id@example.com"}
+	entryName := pluginapi.HostAuthFileEntry{Name: "disk.json", Email: "disk@example.com"}
+	raw, _ := json.Marshal(envelope{OK: true, Result: mustJSON(hostAuthListResponse{Files: []pluginapi.HostAuthFileEntry{entryID, entryName}})})
+	hostAuthInvoker = func() hostAuthListCallResult { return hostAuthListCallResult{raw: raw} }
+	metadata, err := hostAuthMetadata()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := accountLabel(accountKey("cpa", "runtime-id"), metadata); got != "id@example.com" {
+		t.Fatalf("ID mapping = %q", got)
+	}
+	if got := accountLabel(accountKey("cpa", "disk.json"), metadata); got != "disk@example.com" {
+		t.Fatalf("Name fallback mapping = %q", got)
+	}
+	if got := accountLabel(accountKey("cpa", "runtime.json"), metadata); got != accountKey("cpa", "runtime.json") {
+		t.Fatalf("Name must not override ID mapping = %q", got)
+	}
+}
+
+func TestHostAuthMetadataFailuresAreBoundedAndRedacted(t *testing.T) {
+	oldInvoker, oldTimeout := hostAuthInvoker, hostAuthTimeout
+	t.Cleanup(func() {
+		hostAuthInvoker, hostAuthTimeout = oldInvoker, oldTimeout
+		hostAuthCallState.mu.Lock()
+		hostAuthCallState.inFlight = false
+		hostAuthCallState.mu.Unlock()
+	})
+	hostAuthTimeout = 5 * time.Millisecond
+	cases := []struct {
+		name   string
+		result hostAuthListCallResult
+	}{
+		{name: "callback error", result: hostAuthListCallResult{code: 7}},
+		{name: "malformed", result: hostAuthListCallResult{raw: []byte("not-json")}},
+		{name: "empty", result: hostAuthListCallResult{raw: mustJSON(envelope{OK: true, Result: mustJSON(hostAuthListResponse{})})}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			hostAuthInvoker = func() hostAuthListCallResult { return tc.result }
+			if metadata, err := hostAuthMetadata(); err == nil || metadata != nil {
+				t.Fatalf("metadata=%v err=%v", metadata, err)
+			}
+		})
+	}
+	blocked := make(chan struct{})
+	hostAuthInvoker = func() hostAuthListCallResult { <-blocked; return hostAuthListCallResult{} }
+	started := time.Now()
+	if _, err := hostAuthMetadata(); err == nil || time.Since(started) > 100*time.Millisecond {
+		t.Fatalf("timeout err=%v elapsed=%s", err, time.Since(started))
+	}
+	close(blocked)
+	deadline := time.Now().Add(100 * time.Millisecond)
+	for {
+		hostAuthCallState.mu.Lock()
+		pending := hostAuthCallState.inFlight
+		hostAuthCallState.mu.Unlock()
+		if !pending || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func mustJSON(value any) []byte {
+	raw, err := json.Marshal(value)
+	if err != nil {
+		panic(err)
+	}
+	return raw
 }
 
 func TestAccountUsageJSONUsesUIContract(t *testing.T) {
