@@ -224,6 +224,20 @@ type requestLifecycle struct {
 	stopBeat  chan struct{}
 }
 
+// postAuthInterceptRequest is the wire shape used by the post-auth
+// interception callback.  The stock CPA host identifies the selected auth in
+// Metadata["selected_auth_id"]; AuthID is retained here only as an optional
+// compatibility field for host variants that added that convenience field.
+// Keeping this shape local means the plugin also builds against the stock SDK,
+// where RequestInterceptRequest has no AuthID member.
+type postAuthInterceptRequest struct {
+	RequestID string          `json:"RequestID"`
+	AuthID    json.RawMessage `json:"AuthID"`
+	Headers   http.Header     `json:"Headers"`
+	Body      []byte          `json:"Body"`
+	Metadata  map[string]any  `json:"Metadata"`
+}
+
 var localAuthorityShared = newLocalAuthority()
 var state = pluginState{cfg: defaultConfig(), authority: localAuthorityShared, leases: make(map[string]Lease), bound: make(map[string]string), requests: make(map[string]*requestLifecycle)}
 
@@ -571,12 +585,11 @@ func interceptBefore(raw []byte) ([]byte, error) {
 }
 
 func interceptAfter(raw []byte) ([]byte, error) {
-	var req pluginapi.RequestInterceptRequest
+	var req postAuthInterceptRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
 	}
 	req.RequestID = strings.TrimSpace(req.RequestID)
-	req.AuthID = canonicalAuthID(req.AuthID)
 	if req.RequestID == "" {
 		return admissionResponse(&AdmissionError{Code: "invalid_request_id", HTTPStatus: http.StatusBadRequest, Message: "request_id is required"})
 	}
@@ -588,27 +601,34 @@ func interceptAfter(raw []byte) ([]byte, error) {
 		state.mu.Unlock()
 		return admissionResponse(&AdmissionError{Code: "account_concurrency_authority_unavailable", HTTPStatus: http.StatusServiceUnavailable, RetryAfter: defaultRetryAfter, Message: "concurrency authority unavailable", Authority: true})
 	}
+	state.mu.Unlock()
+	if !cfg.Enabled {
+		return okEnvelope(pluginapi.RequestInterceptResponse{Headers: req.Headers, Body: req.Body})
+	}
+	authID, identityErr := selectedAccountID(req.Metadata, req.AuthID)
+	if identityErr != nil {
+		return admissionResponse(identityErr)
+	}
+
+	state.mu.Lock()
 	rs := state.requests[req.RequestID]
 	if rs == nil {
 		rs = &requestLifecycle{}
 		state.requests[req.RequestID] = rs
 	}
 	state.mu.Unlock()
-	if !cfg.Enabled || req.AuthID == "" {
-		return okEnvelope(pluginapi.RequestInterceptResponse{Headers: req.Headers, Body: req.Body})
-	}
 	class := classCold
 	hint, _, warm := affinityHint(req.Metadata)
 	// A verified binding reserves warm capacity only while executing on the
 	// bound original auth. Retries/failovers selected onto another auth are
 	// cold and must use general capacity.
-	if warm && hint != "" && hint != req.AuthID {
+	if warm && hint != "" && hint != authID {
 		warm = false
 	}
 	if warm {
 		class = classWarm
 	}
-	key := accountKey("cpa", req.AuthID)
+	key := accountKey("cpa", authID)
 	if authority == nil {
 		return admissionResponse(&AdmissionError{Code: "account_concurrency_authority_unavailable", HTTPStatus: http.StatusServiceUnavailable, RetryAfter: defaultRetryAfter, Message: "concurrency authority unavailable", Authority: true})
 	}
@@ -627,7 +647,7 @@ func interceptAfter(raw []byte) ([]byte, error) {
 		return okEnvelope(pluginapi.RequestInterceptResponse{Headers: req.Headers, Body: req.Body})
 	}
 	old, bound := rs.lease, rs.bound
-	if bound == req.AuthID && old.Token != "" {
+	if bound == authID && old.Token != "" {
 		return okEnvelope(pluginapi.RequestInterceptResponse{Headers: req.Headers, Body: req.Body})
 	}
 	if old.Token != "" {
@@ -664,9 +684,9 @@ func interceptAfter(raw []byte) ([]byte, error) {
 	}
 	state.mu.Lock()
 	state.leases[req.RequestID] = lease
-	state.bound[req.RequestID] = req.AuthID
+	state.bound[req.RequestID] = authID
 	state.mu.Unlock()
-	rs.lease, rs.bound = lease, req.AuthID
+	rs.lease, rs.bound = lease, authID
 	startHeartbeat(rs, authority, lease)
 	return okEnvelope(pluginapi.RequestInterceptResponse{Headers: req.Headers, Body: req.Body})
 }
@@ -824,6 +844,47 @@ func boundedAuthorityContext() (context.Context, context.CancelFunc) {
 // Case and all interior characters remain significant; distinct IDs therefore
 // cannot silently alias except for this documented whitespace normalization.
 func canonicalAuthID(id string) string { return strings.TrimSpace(id) }
+
+func selectedAccountID(metadata map[string]any, explicitRaw json.RawMessage) (string, *AdmissionError) {
+	explicit := ""
+	if len(explicitRaw) > 0 {
+		var value *string
+		if err := json.Unmarshal(explicitRaw, &value); err != nil {
+			return "", missingAccountIdentityError()
+		}
+		if value != nil {
+			explicit = canonicalAuthID(*value)
+		}
+	}
+
+	selectedValue, selectedPresent := metadata["selected_auth_id"]
+	if selectedPresent {
+		selected, ok := selectedValue.(string)
+		if !ok {
+			return "", missingAccountIdentityError()
+		}
+		selected = canonicalAuthID(selected)
+		if selected == "" {
+			return "", missingAccountIdentityError()
+		}
+		if explicit != "" && explicit != selected {
+			return "", contradictoryAccountIdentityError()
+		}
+		return selected, nil
+	}
+	if explicit != "" {
+		return explicit, nil
+	}
+	return "", missingAccountIdentityError()
+}
+
+func missingAccountIdentityError() *AdmissionError {
+	return &AdmissionError{Code: "account_concurrency_identity_unavailable", HTTPStatus: http.StatusServiceUnavailable, RetryAfter: defaultRetryAfter, Message: "selected account identity unavailable", Authority: true}
+}
+
+func contradictoryAccountIdentityError() *AdmissionError {
+	return &AdmissionError{Code: "account_concurrency_identity_conflict", HTTPStatus: http.StatusServiceUnavailable, RetryAfter: defaultRetryAfter, Message: "selected account identity is contradictory", Authority: true}
+}
 
 func affinityHint(metadata map[string]any) (hint string, strict, warm bool) {
 	if metadata == nil {

@@ -15,6 +15,16 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
+// Keep test payloads independent of the optional AuthID convenience field in
+// newer host SDK checkouts. The plugin's post-auth wire decoder accepts this
+// legacy field, while stock CPA uses Metadata.selected_auth_id.
+type testRequestInterceptRequest struct {
+	RequestID string
+	AuthID    string `json:"AuthID,omitempty"`
+	Model     string
+	Metadata  map[string]any
+}
+
 func resetTestState() {
 	state.gate.Lock()
 	defer state.gate.Unlock()
@@ -64,7 +74,7 @@ func TestManagementRegistrationAndLiveSnapshotAreReadOnlyAndRedacted(t *testing.
 	if !strings.Contains(string(reg), managementUsagePath) || !strings.Contains(string(reg), managementUIPath) {
 		t.Fatalf("registration = %s", reg)
 	}
-	raw, _ := json.Marshal(pluginapi.RequestInterceptRequest{RequestID: "mgmt", AuthID: "account-secret@example.com"})
+	raw, _ := json.Marshal(testRequestInterceptRequest{RequestID: "mgmt", AuthID: "account-secret@example.com"})
 	if _, err := interceptAfter(raw); err != nil {
 		t.Fatal(err)
 	}
@@ -210,7 +220,7 @@ func TestManagementSnapshotRaceSafe(t *testing.T) {
 
 func TestHotReloadFailsClosedUntilInflightLeaseCompletes(t *testing.T) {
 	resetTestState()
-	first, _ := json.Marshal(pluginapi.RequestInterceptRequest{RequestID: "reload", AuthID: "acct"})
+	first, _ := json.Marshal(testRequestInterceptRequest{RequestID: "reload", AuthID: "acct"})
 	if _, err := interceptAfter(first); err != nil {
 		t.Fatal(err)
 	}
@@ -219,7 +229,7 @@ func TestHotReloadFailsClosedUntilInflightLeaseCompletes(t *testing.T) {
 	if err := configure(config); err != nil {
 		t.Fatal(err)
 	}
-	second, _ := json.Marshal(pluginapi.RequestInterceptRequest{RequestID: "new", AuthID: "acct"})
+	second, _ := json.Marshal(testRequestInterceptRequest{RequestID: "new", AuthID: "acct"})
 	out, err := interceptAfter(second)
 	if err != nil {
 		t.Fatal(err)
@@ -243,7 +253,7 @@ func TestHotReloadFailsClosedUntilInflightLeaseCompletes(t *testing.T) {
 
 func TestPluginQuiesceDrainsInflightLeaseAndFencesAdmission(t *testing.T) {
 	resetTestState()
-	raw, _ := json.Marshal(pluginapi.RequestInterceptRequest{RequestID: "drain", AuthID: "acct"})
+	raw, _ := json.Marshal(testRequestInterceptRequest{RequestID: "drain", AuthID: "acct"})
 	if _, err := interceptAfter(raw); err != nil {
 		t.Fatal(err)
 	}
@@ -256,7 +266,7 @@ func TestPluginQuiesceDrainsInflightLeaseAndFencesAdmission(t *testing.T) {
 	}()
 	// Quiescing must stop new work while allowing the old request to complete.
 	time.Sleep(10 * time.Millisecond)
-	newRaw, _ := json.Marshal(pluginapi.RequestInterceptRequest{RequestID: "new", AuthID: "acct"})
+	newRaw, _ := json.Marshal(testRequestInterceptRequest{RequestID: "new", AuthID: "acct"})
 	out, err := interceptAfter(newRaw)
 	if err != nil {
 		t.Fatal(err)
@@ -290,7 +300,7 @@ func TestPluginQuiesceDrainsInflightLeaseAndFencesAdmission(t *testing.T) {
 
 func TestPluginQuiesceTimeoutLeavesAuthorityFenced(t *testing.T) {
 	resetTestState()
-	raw, _ := json.Marshal(pluginapi.RequestInterceptRequest{RequestID: "stuck", AuthID: "acct"})
+	raw, _ := json.Marshal(testRequestInterceptRequest{RequestID: "stuck", AuthID: "acct"})
 	if _, err := interceptAfter(raw); err != nil {
 		t.Fatal(err)
 	}
@@ -298,7 +308,7 @@ func TestPluginQuiesceTimeoutLeavesAuthorityFenced(t *testing.T) {
 	if _, err := handleMethod(pluginabi.MethodPluginQuiesce, payload); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("quiesce error = %v, want deadline exceeded", err)
 	}
-	newRaw, _ := json.Marshal(pluginapi.RequestInterceptRequest{RequestID: "after-timeout", AuthID: "acct"})
+	newRaw, _ := json.Marshal(testRequestInterceptRequest{RequestID: "after-timeout", AuthID: "acct"})
 	out, err := interceptAfter(newRaw)
 	if err != nil {
 		t.Fatal(err)
@@ -443,15 +453,15 @@ func TestSchedulerRejectsFullCapacityAndPreservesStrictAffinity(t *testing.T) {
 
 func TestSelectedAccountBindingTransferAndCompletionRelease(t *testing.T) {
 	resetTestState()
-	before, _ := json.Marshal(pluginapi.RequestInterceptRequest{RequestID: "r1", AuthID: "a"})
+	before, _ := json.Marshal(testRequestInterceptRequest{RequestID: "r1", AuthID: "a"})
 	if _, err := interceptAfter(before); err != nil {
 		t.Fatal(err)
 	}
-	same, _ := json.Marshal(pluginapi.RequestInterceptRequest{RequestID: "r1", AuthID: "a"})
+	same, _ := json.Marshal(testRequestInterceptRequest{RequestID: "r1", AuthID: "a"})
 	if _, err := interceptAfter(same); err != nil {
 		t.Fatal(err)
 	}
-	transfer, _ := json.Marshal(pluginapi.RequestInterceptRequest{RequestID: "r1", AuthID: "b"})
+	transfer, _ := json.Marshal(testRequestInterceptRequest{RequestID: "r1", AuthID: "b"})
 	if _, err := interceptAfter(transfer); err != nil {
 		t.Fatal(err)
 	}
@@ -471,7 +481,7 @@ func TestSelectedAccountBindingTransferAndCompletionRelease(t *testing.T) {
 
 func TestFailedFailoverDoesNotLeaveStaleLeaseBinding(t *testing.T) {
 	resetTestState()
-	raw, _ := json.Marshal(pluginapi.RequestInterceptRequest{RequestID: "r2", AuthID: "a"})
+	raw, _ := json.Marshal(testRequestInterceptRequest{RequestID: "r2", AuthID: "a"})
 	if _, err := interceptAfter(raw); err != nil {
 		t.Fatal(err)
 	}
@@ -484,7 +494,7 @@ func TestFailedFailoverDoesNotLeaveStaleLeaseBinding(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	raw, _ = json.Marshal(pluginapi.RequestInterceptRequest{RequestID: "r2", AuthID: "b"})
+	raw, _ = json.Marshal(testRequestInterceptRequest{RequestID: "r2", AuthID: "b"})
 	out, err := interceptAfter(raw)
 	if err != nil {
 		t.Fatal(err)
@@ -496,7 +506,7 @@ func TestFailedFailoverDoesNotLeaveStaleLeaseBinding(t *testing.T) {
 	if !rejected.Terminate {
 		t.Fatal("full failover account was not rejected")
 	}
-	raw, _ = json.Marshal(pluginapi.RequestInterceptRequest{RequestID: "r2", AuthID: "a"})
+	raw, _ = json.Marshal(testRequestInterceptRequest{RequestID: "r2", AuthID: "a"})
 	out, err = interceptAfter(raw)
 	if err != nil {
 		t.Fatal(err)
@@ -536,7 +546,7 @@ func TestAuthorityFailureFailsClosed(t *testing.T) {
 	state.authority = nil
 	state.cfg.Authority = "redis"
 	state.mu.Unlock()
-	raw, _ := json.Marshal(pluginapi.RequestInterceptRequest{RequestID: "r", AuthID: "a"})
+	raw, _ := json.Marshal(testRequestInterceptRequest{RequestID: "r", AuthID: "a"})
 	out, err := interceptAfter(raw)
 	if err != nil {
 		t.Fatal(err)
@@ -552,7 +562,7 @@ func TestAuthorityFailureFailsClosed(t *testing.T) {
 
 func TestSelectedAuthMetadataIsColdUnlessVerifiedBinding(t *testing.T) {
 	resetTestState()
-	selected, _ := json.Marshal(pluginapi.RequestInterceptRequest{RequestID: "cold", AuthID: "acct", Metadata: map[string]any{"selected_auth_id": "acct"}})
+	selected, _ := json.Marshal(testRequestInterceptRequest{RequestID: "cold", AuthID: "acct", Metadata: map[string]any{"selected_auth_id": "acct"}})
 	if _, err := interceptAfter(selected); err != nil {
 		t.Fatal(err)
 	}
@@ -562,7 +572,7 @@ func TestSelectedAuthMetadataIsColdUnlessVerifiedBinding(t *testing.T) {
 		t.Fatalf("selected-auth lease class = %v, want cold", got)
 	}
 	state.mu.Unlock()
-	verified, _ := json.Marshal(pluginapi.RequestInterceptRequest{RequestID: "warm", AuthID: "acct", Metadata: map[string]any{"cache_auth_id": "acct", "cache_verified": true}})
+	verified, _ := json.Marshal(testRequestInterceptRequest{RequestID: "warm", AuthID: "acct", Metadata: map[string]any{"cache_auth_id": "acct", "cache_verified": true}})
 	if _, err := interceptAfter(verified); err != nil {
 		t.Fatal(err)
 	}
@@ -575,7 +585,7 @@ func TestSelectedAuthMetadataIsColdUnlessVerifiedBinding(t *testing.T) {
 
 func TestPinnedAuthIsWarm(t *testing.T) {
 	resetTestState()
-	raw, _ := json.Marshal(pluginapi.RequestInterceptRequest{RequestID: "pinned", AuthID: "acct", Metadata: map[string]any{"pinned_auth_id": "acct"}})
+	raw, _ := json.Marshal(testRequestInterceptRequest{RequestID: "pinned", AuthID: "acct", Metadata: map[string]any{"pinned_auth_id": "acct"}})
 	if _, err := interceptAfter(raw); err != nil {
 		t.Fatal(err)
 	}
@@ -588,11 +598,11 @@ func TestPinnedAuthIsWarm(t *testing.T) {
 
 func TestVerifiedBindingDoesNotMakeColdFailoverWarm(t *testing.T) {
 	resetTestState()
-	first, _ := json.Marshal(pluginapi.RequestInterceptRequest{RequestID: "retry", AuthID: "a", Metadata: map[string]any{"cache_auth_id": "a", "cache_verified": true}})
+	first, _ := json.Marshal(testRequestInterceptRequest{RequestID: "retry", AuthID: "a", Metadata: map[string]any{"cache_auth_id": "a", "cache_verified": true}})
 	if _, err := interceptAfter(first); err != nil {
 		t.Fatal(err)
 	}
-	retry, _ := json.Marshal(pluginapi.RequestInterceptRequest{RequestID: "retry", AuthID: "b", Metadata: map[string]any{"cache_auth_id": "a", "cache_verified": true, "selected_auth_id": "b"}})
+	retry, _ := json.Marshal(testRequestInterceptRequest{RequestID: "retry", AuthID: "b", Metadata: map[string]any{"cache_auth_id": "a", "cache_verified": true, "selected_auth_id": "b"}})
 	if _, err := interceptAfter(retry); err != nil {
 		t.Fatal(err)
 	}
@@ -641,7 +651,7 @@ func TestCapacityRejectionDoesNotPoisonAuthorityAndRecoversAfterRelease(t *testi
 	state.mu.Lock()
 	state.authority = a
 	state.mu.Unlock()
-	raw, _ := json.Marshal(pluginapi.RequestInterceptRequest{RequestID: "capacity-1", AuthID: "acct"})
+	raw, _ := json.Marshal(testRequestInterceptRequest{RequestID: "capacity-1", AuthID: "acct"})
 	for i := 0; i < 2; i++ {
 		out, err := interceptAfter(raw)
 		if err != nil {
@@ -682,7 +692,7 @@ func TestCapacityRejectionDoesNotPoisonAuthorityAndRecoversAfterRelease(t *testi
 
 func TestEmptyRequestIDIsRejectedWithoutLease(t *testing.T) {
 	resetTestState()
-	raw, _ := json.Marshal(pluginapi.RequestInterceptRequest{AuthID: "acct"})
+	raw, _ := json.Marshal(testRequestInterceptRequest{AuthID: "acct"})
 	out, err := interceptAfter(raw)
 	if err != nil {
 		t.Fatal(err)
@@ -703,11 +713,11 @@ func TestEmptyRequestIDIsRejectedWithoutLease(t *testing.T) {
 
 func TestAuthIDWhitespaceAliasIsStable(t *testing.T) {
 	resetTestState()
-	first, _ := json.Marshal(pluginapi.RequestInterceptRequest{RequestID: "alias", AuthID: " acct "})
+	first, _ := json.Marshal(testRequestInterceptRequest{RequestID: "alias", AuthID: " acct "})
 	if _, err := interceptAfter(first); err != nil {
 		t.Fatal(err)
 	}
-	second, _ := json.Marshal(pluginapi.RequestInterceptRequest{RequestID: "alias", AuthID: "acct"})
+	second, _ := json.Marshal(testRequestInterceptRequest{RequestID: "alias", AuthID: "acct"})
 	if _, err := interceptAfter(second); err != nil {
 		t.Fatal(err)
 	}
@@ -718,6 +728,107 @@ func TestAuthIDWhitespaceAliasIsStable(t *testing.T) {
 	}
 }
 
+func TestStockSelectedAuthMetadataDrivesSharedAccountAdmissionAndRelease(t *testing.T) {
+	resetTestState()
+	base := newLocalAuthority()
+	a := &countingAuthority{localAuthority: base}
+	state.mu.Lock()
+	state.authority = a
+	state.cfg.MaxConcurrency = 1
+	state.cfg.WarmReservedSlots = 0
+	state.cfg.WaitTimeout = 2 * time.Millisecond
+	state.mu.Unlock()
+
+	// This is the stock CPA post-auth shape: no AuthID field, with the selected
+	// account carried in request metadata.
+	first, _ := json.Marshal(testRequestInterceptRequest{RequestID: "stock-1", Model: "model-a", Metadata: map[string]any{"selected_auth_id": "acct-stock"}})
+	if _, err := interceptAfter(first); err != nil {
+		t.Fatal(err)
+	}
+	second, _ := json.Marshal(testRequestInterceptRequest{RequestID: "stock-2", Model: "model-b", Metadata: map[string]any{"selected_auth_id": "acct-stock"}})
+	out, err := interceptAfter(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var env envelope
+	if err := json.Unmarshal(out, &env); err != nil {
+		t.Fatal(err)
+	}
+	var rejected pluginapi.RequestInterceptResponse
+	if err := json.Unmarshal(env.Result, &rejected); err != nil {
+		t.Fatal(err)
+	}
+	if !rejected.Terminate || rejected.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("second model bypassed shared account cap: %#v", rejected)
+	}
+	if strings.Contains(string(rejected.ResponseBody), "acct-stock") {
+		t.Fatalf("admission response leaked selected account: %s", rejected.ResponseBody)
+	}
+
+	completion, _ := json.Marshal(pluginapi.RequestCompletion{RequestID: "stock-1", Outcome: pluginapi.RequestCompletionSucceeded})
+	if _, err := complete(completion); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := complete(completion); err != nil {
+		t.Fatal(err)
+	}
+	a.mu.Lock()
+	acquires, releases := a.acquires, a.releases
+	a.mu.Unlock()
+	if acquires != 2 || releases != 1 {
+		t.Fatalf("metadata lease lifecycle acquire/release = %d/%d, want 2/1", acquires, releases)
+	}
+}
+
+func TestExplicitAuthIDCompatibilityAndIdentityFailuresFailClosed(t *testing.T) {
+	resetTestState()
+	legacy, _ := json.Marshal(testRequestInterceptRequest{RequestID: "legacy", AuthID: "legacy-acct"})
+	if _, err := interceptAfter(legacy); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := complete([]byte(`{"request_id":"legacy"}`)); err != nil {
+		t.Fatal(err)
+	}
+
+	requestIDs := map[string]string{"missing": "missing", "empty_selected": "empty-selected", "contradictory": "contradictory", "malformed": "malformed"}
+	for name, payload := range map[string][]byte{
+		"missing":        []byte(`{"RequestID":"missing","Model":"m"}`),
+		"empty_selected": []byte(`{"RequestID":"empty-selected","Metadata":{"selected_auth_id":"   "}}`),
+		"contradictory":  []byte(`{"RequestID":"contradictory","AuthID":"secret-explicit","Metadata":{"selected_auth_id":"secret-selected"}}`),
+		"malformed":      []byte(`{"RequestID":"malformed","Metadata":{"selected_auth_id":42}}`),
+	} {
+		t.Run(name, func(t *testing.T) {
+			out, err := interceptAfter(payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var env envelope
+			if err := json.Unmarshal(out, &env); err != nil {
+				t.Fatal(err)
+			}
+			var rejected pluginapi.RequestInterceptResponse
+			if err := json.Unmarshal(env.Result, &rejected); err != nil {
+				t.Fatal(err)
+			}
+			if !rejected.Terminate || rejected.StatusCode != http.StatusServiceUnavailable {
+				t.Fatalf("identity failure passed through: %#v", rejected)
+			}
+			body := string(rejected.ResponseBody)
+			for _, secret := range []string{"secret-explicit", "secret-selected"} {
+				if strings.Contains(body, secret) {
+					t.Fatalf("identity failure leaked %q: %s", secret, body)
+				}
+			}
+			state.mu.Lock()
+			_, tracked := state.requests[requestIDs[name]]
+			state.mu.Unlock()
+			if tracked {
+				t.Fatal("identity failure left a request lifecycle record")
+			}
+		})
+	}
+}
+
 func TestRenewalFailureFencesUntilCompletion(t *testing.T) {
 	resetTestState()
 	base := &countingAuthority{localAuthority: newLocalAuthority()}
@@ -725,7 +836,7 @@ func TestRenewalFailureFencesUntilCompletion(t *testing.T) {
 	state.mu.Lock()
 	state.authority = a
 	state.mu.Unlock()
-	raw, _ := json.Marshal(pluginapi.RequestInterceptRequest{RequestID: "fenced", AuthID: "acct"})
+	raw, _ := json.Marshal(testRequestInterceptRequest{RequestID: "fenced", AuthID: "acct"})
 	if _, err := interceptAfter(raw); err != nil {
 		t.Fatal(err)
 	}
@@ -787,7 +898,7 @@ func TestRenewalLossAttemptsDistributedFence(t *testing.T) {
 	state.mu.Lock()
 	state.authority = a
 	state.mu.Unlock()
-	raw, _ := json.Marshal(pluginapi.RequestInterceptRequest{RequestID: "fence-distributed", AuthID: "acct"})
+	raw, _ := json.Marshal(testRequestInterceptRequest{RequestID: "fence-distributed", AuthID: "acct"})
 	if _, err := interceptAfter(raw); err != nil {
 		t.Fatal(err)
 	}
@@ -843,7 +954,7 @@ func TestSchedulerAuthorityCallHasDeadline(t *testing.T) {
 
 func TestReconfigureDoesNotClearUncertaintyWithTrackedLease(t *testing.T) {
 	resetTestState()
-	raw, _ := json.Marshal(pluginapi.RequestInterceptRequest{RequestID: "uncertain", AuthID: "acct"})
+	raw, _ := json.Marshal(testRequestInterceptRequest{RequestID: "uncertain", AuthID: "acct"})
 	if _, err := interceptAfter(raw); err != nil {
 		t.Fatal(err)
 	}
@@ -861,7 +972,7 @@ func TestReconfigureDoesNotClearUncertaintyWithTrackedLease(t *testing.T) {
 
 func TestReconfigureShutdownAndLateCallbacksRaceSafely(t *testing.T) {
 	resetTestState()
-	raw, _ := json.Marshal(pluginapi.RequestInterceptRequest{RequestID: "race", AuthID: "acct"})
+	raw, _ := json.Marshal(testRequestInterceptRequest{RequestID: "race", AuthID: "acct"})
 	config, _ := json.Marshal(lifecycleRequest{SchemaVersion: 4, ConfigYAML: []byte("max_concurrency: 2\nwait_timeout: 1ms\nauthority: local\n")})
 	var wg sync.WaitGroup
 	for i := 0; i < 16; i++ {
@@ -910,7 +1021,7 @@ func TestConcurrentCallbacksSerializePerRequest(t *testing.T) {
 	state.mu.Lock()
 	state.authority = a
 	state.mu.Unlock()
-	raw, _ := json.Marshal(pluginapi.RequestInterceptRequest{RequestID: "concurrent", AuthID: "acct"})
+	raw, _ := json.Marshal(testRequestInterceptRequest{RequestID: "concurrent", AuthID: "acct"})
 	var wg sync.WaitGroup
 	for i := 0; i < 32; i++ {
 		wg.Add(1)
@@ -943,7 +1054,7 @@ func TestCompletionTombstonePreventsLateAcquire(t *testing.T) {
 	if _, err := complete(completion); err != nil {
 		t.Fatal(err)
 	}
-	raw, _ := json.Marshal(pluginapi.RequestInterceptRequest{RequestID: "late", AuthID: "acct"})
+	raw, _ := json.Marshal(testRequestInterceptRequest{RequestID: "late", AuthID: "acct"})
 	if _, err := interceptAfter(raw); err != nil {
 		t.Fatal(err)
 	}
@@ -961,7 +1072,7 @@ func TestShutdownMarksRequestsTerminalAndRejectsAdmission(t *testing.T) {
 	state.mu.Lock()
 	state.authority = a
 	state.mu.Unlock()
-	raw, _ := json.Marshal(pluginapi.RequestInterceptRequest{RequestID: "shutdown", AuthID: "acct"})
+	raw, _ := json.Marshal(testRequestInterceptRequest{RequestID: "shutdown", AuthID: "acct"})
 	if _, err := interceptAfter(raw); err != nil {
 		t.Fatal(err)
 	}
@@ -1069,7 +1180,7 @@ func TestRedisAcquireFenceProducesTypedAuthorityUnavailable(t *testing.T) {
 	state.authority = newRedisAuthority(fencedRedis{}, "cpa:test")
 	state.mu.Unlock()
 
-	raw, _ := json.Marshal(pluginapi.RequestInterceptRequest{RequestID: "fenced", AuthID: "acct"})
+	raw, _ := json.Marshal(testRequestInterceptRequest{RequestID: "fenced", AuthID: "acct"})
 	out, err := interceptAfter(raw)
 	if err != nil {
 		t.Fatal(err)
