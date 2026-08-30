@@ -245,6 +245,8 @@ func TestAuthEntryUnavailableUsesOnlyExplicitStatusMetadata(t *testing.T) {
 		{name: "unauthorized status", entry: pluginapi.HostAuthFileEntry{Status: "unauthorized"}, want: true},
 		{name: "http 401 message", entry: pluginapi.HostAuthFileEntry{StatusMessage: "HTTP 401 Unauthorized; re-login required"}, want: true},
 		{name: "failed status", entry: pluginapi.HostAuthFileEntry{Status: "authentication_error"}, want: true},
+		{name: "authentication failure status", entry: pluginapi.HostAuthFileEntry{Status: "  Authentication Failure  "}, want: true},
+		{name: "authentication failure message", entry: pluginapi.HostAuthFileEntry{StatusMessage: "authentication failure"}, want: true},
 		{name: "retry window", entry: pluginapi.HostAuthFileEntry{NextRetryAfter: future}, want: true},
 		{name: "usable status", entry: pluginapi.HostAuthFileEntry{Name: "account-401.json", Status: "active", StatusMessage: "ready"}, want: false},
 		{name: "empty status", entry: pluginapi.HostAuthFileEntry{Name: "401.json"}, want: false},
@@ -696,8 +698,8 @@ func TestRedisSnapshotFiltersUnavailableRowsAndSumsAvailableOnly(t *testing.T) {
 	t.Cleanup(func() { hostAuthInvoker, hostAuthTimeout = oldInvoker, oldTimeout; resetTestState() })
 	entries := []pluginapi.HostAuthFileEntry{
 		{ID: "redis-a", Email: "usable@example.com", Status: "ready"},
-		{ID: "redis-b", Name: "unauthorized-401.json", StatusMessage: "HTTP 401; re-login required"},
-		{ID: "redis-c", Name: "disabled.json", Unavailable: true},
+		{ID: "redis-b", Name: "authentication-failure-status.json", Status: "Authentication Failure"},
+		{ID: "redis-c", Name: "authentication-failure-message.json", StatusMessage: " authentication failure "},
 	}
 	raw := mustJSON(envelope{OK: true, Result: mustJSON(hostAuthListResponse{Files: entries})})
 	hostAuthInvoker = func() hostAuthListCallResult { return hostAuthListCallResult{raw: raw} }

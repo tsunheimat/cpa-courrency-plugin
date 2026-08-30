@@ -297,7 +297,7 @@ func explicitUnavailableStatus(value string) bool {
 	// Status messages are structured metadata supplied by the host. Match
 	// authentication failures and explicit unusable states, including HTTP 401,
 	// without applying any heuristic to account names or filenames.
-	for _, token := range []string{"disabled", "unavailable", "unauthorized", "unauthorised", "unauthenticated", "authentication failed", "authentication_failure", "authentication_error", "authentication_required", "auth failed", "auth_failure", "auth_error", "auth_required", "invalid credential", "invalid_credentials", "login required", "login_required", "not ready", "not_ready", "unusable", "cannot use", "cannot_use", "no credentials", "missing credential", "reauth", "relogin", "re-login", "reauthorize", "re-authorize", "forbidden", "rate limited", "rate_limited", "quota exhausted", "quota_exhausted", "suspended", "revoked", "401", "403", "429"} {
+	for _, token := range []string{"disabled", "unavailable", "unauthorized", "unauthorised", "unauthenticated", "authentication failed", "authentication failure", "authentication_failure", "authentication_error", "authentication_required", "auth failed", "auth_failure", "auth_error", "auth_required", "invalid credential", "invalid_credentials", "login required", "login_required", "not ready", "not_ready", "unusable", "cannot use", "cannot_use", "no credentials", "missing credential", "reauth", "relogin", "re-login", "reauthorize", "re-authorize", "forbidden", "rate limited", "rate_limited", "quota exhausted", "quota_exhausted", "suspended", "revoked", "401", "403", "429"} {
 		if strings.Contains(value, token) {
 			return true
 		}
