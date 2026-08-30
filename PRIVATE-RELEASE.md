@@ -13,30 +13,24 @@ management/environment; no token belongs in this repository or in the registry.
 
 ## Release asset contract
 
-For version `0.1.4`, publish these assets on GitHub Release tag `v0.1.4`:
+For version `0.1.5`, publish these assets on GitHub Release tag `v0.1.5`:
 
 ```text
-cpa-account-concurrency_0.1.4_linux_amd64.zip
+cpa-account-concurrency_0.1.5_linux_amd64.zip
 checksums.txt
 ```
 
-Version `0.1.4` includes the persistent browser Management-key authentication repair and the bounded stock CPA auth metadata observability repair
-from commit `6d0c24c2dfc9c153cba747456197dc96f13ad7c4`: management label lookup
-times out and falls back to hashed keys without affecting admission, and disk
-fallback entries map through their auth JSON filename when no ID is supplied.
-Timed-out metadata workers remain single-flight and are fenced and joined by
-shutdown, reload, and reinitialization before the host API can be released.
-It also removes the browser-side `/v0/management/auth-files` fetch. Version
-`0.1.4` retains the stock CPA compatibility repair from commit
-`198e407979e55ef30bd33b61a99a53c430e9878d`: the plugin resolves the selected
-account from stock CPA `Metadata["selected_auth_id"]` without requiring any
-CPA/CLIProxyAPI host source change. The account-level hard in-flight admission,
-fail-closed identity handling, lifecycle release, authenticated read-only usage
-UI, private registry/store model, and single-CPA `authority: local` configuration
-remain unchanged. The UI's Settings area stores the CPA Management key only in
-browser-local storage for the current origin, sends it via `X-Management-Key`,
-and provides explicit save/update and clear actions; no key is stored by the
-plugin or host.
+Version `0.1.5` includes the all-available-account observability repair from
+commit `03c7c1ec336453a6af5f947f5718627d16024162`. The usage view uses the
+stock `host.auth.list` result as the account index for both local and Redis
+authority, reads each listed account through the selected authority, and
+renders idle accounts as `0 / limit` and `0 / reserved`. The UI now contains
+only the compact `Account`, `Total (in-flight / limit)`, and `Warm reserved
+(in-flight / reserved)` columns; aggregate fields that mixed per-account
+limits with cross-account totals are omitted. The account-level hard in-flight
+admission, selected-auth identity, lease lifecycle, routing, prompt-cache
+behavior, and Management-key browser storage remain unchanged. No
+CPA/CLIProxyAPI host source change is required.
 
 The ZIP must contain the dynamic library at its root using this name:
 
@@ -102,9 +96,9 @@ GOOS=linux GOARCH=amd64 \
   go build -trimpath -buildmode=c-shared \
   -o cpa-account-concurrency.so .
 
-zip -X cpa-account-concurrency_0.1.4_linux_amd64.zip \
+zip -X cpa-account-concurrency_0.1.5_linux_amd64.zip \
 	  cpa-account-concurrency.so
-sha256sum cpa-account-concurrency_0.1.4_linux_amd64.zip > checksums.txt
+sha256sum cpa-account-concurrency_0.1.5_linux_amd64.zip > checksums.txt
 ```
 
 The checked-in `registry.json` is metadata only; source and release assets are
