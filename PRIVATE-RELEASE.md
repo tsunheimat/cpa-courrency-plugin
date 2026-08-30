@@ -13,21 +13,30 @@ management/environment; no token belongs in this repository or in the registry.
 
 ## Release asset contract
 
-For version `0.1.5`, publish these assets on GitHub Release tag `v0.1.5`:
+The latest published release remains `0.1.5`. The contract below describes the
+next source version; this change is intentionally not published by this task.
+
+For version `0.1.6`, publish these assets on GitHub Release tag `v0.1.6`:
 
 ```text
-cpa-account-concurrency_0.1.5_linux_amd64.zip
+cpa-account-concurrency_0.1.6_linux_amd64.zip
 checksums.txt
 ```
 
-Version `0.1.5` includes the all-available-account observability repair from
-commit `03c7c1ec336453a6af5f947f5718627d16024162`. The usage view uses the
-stock `host.auth.list` result as the account index for both local and Redis
-authority, reads each listed account through the selected authority, and
-renders idle accounts as `0 / limit` and `0 / reserved`. The UI now contains
-only the compact `Account`, `Total (in-flight / limit)`, and `Warm reserved
-(in-flight / reserved)` columns; aggregate fields that mixed per-account
-limits with cross-account totals are omitted. The account-level hard in-flight
+Version `0.1.6` adds status-only filtering and aggregate observability on top of
+the all-available-account repair from commit
+`03c7c1ec336453a6af5f947f5718627d16024162`. The usage view uses the stock
+`host.auth.list` result as the account index for both local and Redis authority,
+filters only explicit disabled/unavailable/authentication-failure metadata
+(including HTTP 401 and future retry windows), reads each remaining account
+through the selected authority, and renders idle accounts as `0 / limit` and
+`0 / reserved`. Names and filenames are never used as availability heuristics,
+so a usable account named with `401` remains visible. The UI includes a clearly
+labelled **All available accounts** summary whose Total and Warm reserved
+values are sums of the displayed rows only. The table remains the compact
+`Account`, `Total (in-flight / limit)`, and `Warm reserved (in-flight /
+reserved)` columns; aggregate fields that mixed per-account limits with
+cross-account totals remain omitted. The account-level hard in-flight
 admission, selected-auth identity, lease lifecycle, routing, prompt-cache
 behavior, and Management-key browser storage remain unchanged. No
 CPA/CLIProxyAPI host source change is required.
@@ -96,9 +105,9 @@ GOOS=linux GOARCH=amd64 \
   go build -trimpath -buildmode=c-shared \
   -o cpa-account-concurrency.so .
 
-zip -X cpa-account-concurrency_0.1.5_linux_amd64.zip \
-	  cpa-account-concurrency.so
-sha256sum cpa-account-concurrency_0.1.5_linux_amd64.zip > checksums.txt
+zip -X cpa-account-concurrency_0.1.6_linux_amd64.zip \
+	cpa-account-concurrency.so
+sha256sum cpa-account-concurrency_0.1.6_linux_amd64.zip > checksums.txt
 ```
 
 The checked-in `registry.json` is metadata only; source and release assets are

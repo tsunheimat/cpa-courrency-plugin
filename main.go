@@ -93,22 +93,39 @@ type managementRegistrationPayload struct {
 }
 
 type concurrencySnapshot struct {
-	ConfiguredLimit   int            `json:"-"`
-	WarmReserved      int            `json:"-"`
-	InFlight          int            `json:"-"`
-	WarmInFlight      int            `json:"-"`
-	GeneralInFlight   int            `json:"-"`
-	GeneralCapacity   int            `json:"-"`
-	AvailableCapacity int            `json:"-"`
-	Authority         string         `json:"authority"`
-	AuthorityState    string         `json:"authority_state"`
-	CapacityState     string         `json:"-"`
-	AccountsInUse     int            `json:"-"`
-	Empty             bool           `json:"-"`
-	LastRefresh       time.Time      `json:"last_refresh"`
-	Stale             bool           `json:"stale"`
-	Error             string         `json:"error,omitempty"`
-	Accounts          []AccountUsage `json:"accounts,omitempty"`
+	ConfiguredLimit   int                `json:"-"`
+	WarmReserved      int                `json:"-"`
+	InFlight          int                `json:"-"`
+	WarmInFlight      int                `json:"-"`
+	GeneralInFlight   int                `json:"-"`
+	GeneralCapacity   int                `json:"-"`
+	AvailableCapacity int                `json:"-"`
+	Authority         string             `json:"authority"`
+	AuthorityState    string             `json:"authority_state"`
+	CapacityState     string             `json:"-"`
+	AccountsInUse     int                `json:"-"`
+	Empty             bool               `json:"-"`
+	LastRefresh       time.Time          `json:"last_refresh"`
+	Stale             bool               `json:"stale"`
+	Error             string             `json:"error,omitempty"`
+	Accounts          []AccountUsage     `json:"accounts,omitempty"`
+	Summary           concurrencySummary `json:"summary,omitempty"`
+}
+
+type concurrencySummary struct {
+	Label        string           `json:"label"`
+	Total        totalUsageMetric `json:"total"`
+	WarmReserved warmUsageMetric  `json:"warm_reserved"`
+}
+
+type totalUsageMetric struct {
+	InFlight int `json:"in_flight"`
+	Limit    int `json:"limit"`
+}
+
+type warmUsageMetric struct {
+	InFlight int `json:"in_flight"`
+	Reserved int `json:"reserved"`
 }
 
 const (
@@ -236,6 +253,9 @@ func hostAuthMetadata() (map[string]pluginapi.HostAuthFileEntry, error) {
 	}
 	byKey := make(map[string]pluginapi.HostAuthFileEntry, len(listed.Files))
 	for _, entry := range listed.Files {
+		if authEntryUnavailable(entry) {
+			continue
+		}
 		id := canonicalAuthID(entry.ID)
 		if id == "" {
 			// CPA's stock disk fallback has no runtime ID; its Name is the
@@ -247,10 +267,47 @@ func hostAuthMetadata() (map[string]pluginapi.HostAuthFileEntry, error) {
 		}
 		byKey[accountKey("cpa", id)] = entry
 	}
-	if len(byKey) == 0 {
-		return nil, errors.New("host auth list returned no usable entries")
-	}
 	return byKey, nil
+}
+
+// authEntryUnavailable is intentionally based only on explicit host status
+// metadata. Names, IDs, labels, paths, and credential contents are never
+// consulted when deciding whether an account can be displayed.
+func authEntryUnavailable(entry pluginapi.HostAuthFileEntry) bool {
+	if entry.Disabled || entry.Unavailable {
+		return true
+	}
+	if !entry.NextRetryAfter.IsZero() && entry.NextRetryAfter.After(time.Now()) {
+		return true
+	}
+	status := strings.ToLower(strings.TrimSpace(entry.Status))
+	message := strings.ToLower(strings.TrimSpace(entry.StatusMessage))
+	for _, value := range []string{status, message} {
+		if explicitUnavailableStatus(value) {
+			return true
+		}
+	}
+	return false
+}
+
+func explicitUnavailableStatus(value string) bool {
+	if value == "" {
+		return false
+	}
+	// Status messages are structured metadata supplied by the host. Match
+	// authentication failures and explicit unusable states, including HTTP 401,
+	// without applying any heuristic to account names or filenames.
+	for _, token := range []string{"disabled", "unavailable", "unauthorized", "unauthorised", "unauthenticated", "authentication failed", "authentication_failure", "authentication_error", "authentication_required", "auth failed", "auth_failure", "auth_error", "auth_required", "invalid credential", "invalid_credentials", "login required", "login_required", "not ready", "not_ready", "unusable", "cannot use", "cannot_use", "no credentials", "missing credential", "reauth", "relogin", "re-login", "reauthorize", "re-authorize", "forbidden", "rate limited", "rate_limited", "quota exhausted", "quota_exhausted", "suspended", "revoked", "401", "403", "429"} {
+		if strings.Contains(value, token) {
+			return true
+		}
+	}
+	for _, token := range []string{"error", "failed", "failure", "cooldown", "cooling", "blocked", "expired", "revoked", "degraded"} {
+		if value == token || strings.HasPrefix(value, token+" ") || strings.HasPrefix(value, token+":") || strings.HasPrefix(value, token+"_") || strings.HasPrefix(value, token+"-") {
+			return true
+		}
+	}
+	return false
 }
 
 // retireHostAuthWorker fences new host callbacks and joins the sole callback
@@ -349,6 +406,7 @@ func readConcurrencySnapshot(ctx context.Context) concurrencySnapshot {
 		} else {
 			s.Accounts = accounts
 			s.InFlight, s.WarmInFlight, s.AccountsInUse = usage.InFlight, usage.WarmFlight, countActiveAccounts(accounts)
+			s.Summary = summaryFromAccounts(accounts)
 		}
 	}
 	if !s.Stale {
@@ -359,6 +417,17 @@ func readConcurrencySnapshot(ctx context.Context) concurrencySnapshot {
 		}
 	}
 	return s
+}
+
+func summaryFromAccounts(accounts []AccountUsage) concurrencySummary {
+	summary := concurrencySummary{Label: "All available accounts"}
+	for _, account := range accounts {
+		summary.Total.InFlight += account.InFlight
+		summary.Total.Limit += account.Limit
+		summary.WarmReserved.InFlight += account.WarmFlight
+		summary.WarmReserved.Reserved += account.Reserved
+	}
+	return summary
 }
 
 // availableAccountSnapshots reads usage only for accounts successfully returned
@@ -402,19 +471,19 @@ func countActiveAccounts(accounts []AccountUsage) int {
 // into metrics/errors.
 const managementHTMLAuthenticated = `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>CPA concurrency</title>
-<style>body{font:16px system-ui,sans-serif;max-width:760px;margin:2rem auto;padding:0 1rem;color:#17202a}h1{font-size:1.5rem}.settings{border:1px solid #b8c2cc;border-radius:6px;padding:1rem;margin:1rem 0}.settings form{display:flex;gap:.5rem;flex-wrap:wrap;align-items:end}.settings label{display:flex;flex-direction:column;gap:.25rem;flex:1 1 280px}.settings input{font:inherit;padding:.45rem}.settings p{margin:.75rem 0 0;color:#4b5563;font-size:.9rem}#state{margin:1rem 0;padding:.75rem;border-left:4px solid #4b5563;background:#f3f4f6}button{padding:.5rem .75rem;font:inherit}table{width:100%;border-collapse:collapse;margin-top:1.25rem}th,td{text-align:left;border-bottom:1px solid #d1d5db;padding:.5rem;font-variant-numeric:tabular-nums}th:nth-child(n+2),td:nth-child(n+2){text-align:right}</style></head>
+<style>body{font:16px system-ui,sans-serif;max-width:760px;margin:2rem auto;padding:0 1rem;color:#17202a}h1{font-size:1.5rem}.settings{border:1px solid #b8c2cc;border-radius:6px;padding:1rem;margin:1rem 0}.settings form{display:flex;gap:.5rem;flex-wrap:wrap;align-items:end}.settings label{display:flex;flex-direction:column;gap:.25rem;flex:1 1 280px}.settings input{font:inherit;padding:.45rem}.settings p{margin:.75rem 0 0;color:#4b5563;font-size:.9rem}#state{margin:1rem 0;padding:.75rem;border-left:4px solid #4b5563;background:#f3f4f6}.summary{border:1px solid #b8c2cc;border-radius:6px;padding:.75rem 1rem;margin:1rem 0}.summary h2{font-size:1rem;margin:0 0 .5rem}.summary dl{display:flex;gap:2rem;margin:0;flex-wrap:wrap}.summary dt{font-size:.85rem;color:#4b5563}.summary dd{margin:.15rem 0 0;font-variant-numeric:tabular-nums}button{padding:.5rem .75rem;font:inherit}table{width:100%;border-collapse:collapse;margin-top:1.25rem}th,td{text-align:left;border-bottom:1px solid #d1d5db;padding:.5rem;font-variant-numeric:tabular-nums}th:nth-child(n+2),td:nth-child(n+2){text-align:right}</style></head>
 <body><h1>CPA account concurrency</h1>
 <section class="settings" aria-labelledby="settings-title"><h2 id="settings-title">Settings</h2><form id="settings-form"><label for="management-key">CPA Management key<input id="management-key" name="management-key" type="password" autocomplete="off" spellcheck="false"></label><button id="save-key" type="submit">Save key</button><button id="clear-key" type="button">Clear saved key</button></form><p id="key-status" role="status" aria-live="polite"></p></section>
-<p><button id="refresh" type="button">Refresh now</button> <span id="updated" aria-live="polite"></span></p><div id="state" role="status" aria-live="polite">Loading live usage...</div><table><caption>Available CPA accounts</caption><thead><tr><th scope="col">Account</th><th scope="col">Total (in-flight / limit)</th><th scope="col">Warm reserved (in-flight / reserved)</th></tr></thead><tbody id="accounts"></tbody></table>
+<p><button id="refresh" type="button">Refresh now</button> <span id="updated" aria-live="polite"></span></p><div id="state" role="status" aria-live="polite">Loading live usage...</div><section class="summary" aria-labelledby="summary-title"><h2 id="summary-title">All available accounts</h2><dl><div><dt>Total (in-flight / limit)</dt><dd id="summary-total">--</dd></div><div><dt>Warm reserved (in-flight / reserved)</dt><dd id="summary-warm">--</dd></div></dl></section><table><caption>Available CPA accounts</caption><thead><tr><th scope="col">Account</th><th scope="col">Total (in-flight / limit)</th><th scope="col">Warm reserved (in-flight / reserved)</th></tr></thead><tbody id="accounts"></tbody></table>
 <script>(function(){
 const api='/v0/management/plugins/cpa-account-concurrency/usage',storageKey='cpa-account-concurrency.management-key';
-const state=document.getElementById('state'),accounts=document.getElementById('accounts'),updated=document.getElementById('updated'),keyInput=document.getElementById('management-key'),keyStatus=document.getElementById('key-status');
+const state=document.getElementById('state'),accounts=document.getElementById('accounts'),updated=document.getElementById('updated'),summaryTotal=document.getElementById('summary-total'),summaryWarm=document.getElementById('summary-warm'),keyInput=document.getElementById('management-key'),keyStatus=document.getElementById('key-status');
 const esc=v=>String(v??'').replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[c]));
 function readKey(){try{return localStorage.getItem(storageKey)||''}catch(_){return ''}}
 function writeKey(value){try{localStorage.setItem(storageKey,value);return true}catch(_){return false}}
 function removeKey(){try{localStorage.removeItem(storageKey);return true}catch(_){return false}}
-function clearUsage(){accounts.innerHTML='';updated.textContent=''}
-function render(d){accounts.innerHTML=(d.accounts||[]).map(a=>'<tr><td>'+esc(a.label||'Account')+'</td><td>'+a.in_flight+' / '+a.limit+'</td><td>'+a.warm_flight+' / '+a.reserved+'</td></tr>').join('');let msg='Authority: '+(d.authority_state||'unknown');if(d.stale)msg+='; stale';if(d.error)msg+='; '+d.error;state.textContent=msg;updated.textContent=d.last_refresh?'Last refresh '+new Date(d.last_refresh).toLocaleTimeString():''}
+function clearUsage(){accounts.innerHTML='';summaryTotal.textContent='--';summaryWarm.textContent='--';updated.textContent=''}
+function render(d){const summary=d.summary||{};const total=summary.total||{};const warm=summary.warm_reserved||{};summaryTotal.textContent=(total.in_flight??0)+' / '+(total.limit??0);summaryWarm.textContent=(warm.in_flight??0)+' / '+(warm.reserved??0);accounts.innerHTML=(d.accounts||[]).map(a=>'<tr><td>'+esc(a.label||'Account')+'</td><td>'+a.in_flight+' / '+a.limit+'</td><td>'+a.warm_flight+' / '+a.reserved+'</td></tr>').join('');let msg='Authority: '+(d.authority_state||'unknown');if(d.stale)msg+='; stale';if(d.error)msg+='; '+d.error;state.textContent=msg;updated.textContent=d.last_refresh?'Last refresh '+new Date(d.last_refresh).toLocaleTimeString():''}
 async function load(){const authKey=readKey();if(!authKey){state.textContent='Management key required. Save a key in Settings to load live usage.';clearUsage();return}state.textContent='Loading live usage...';try{const r=await fetch(api,{method:'GET',credentials:'same-origin',cache:'no-store',headers:{'X-Management-Key':authKey}});if(!r.ok){if(r.status===401||r.status===403){state.textContent='Management authentication required.'}else{state.textContent='Unable to load live usage.'}clearUsage();return}render(await r.json())}catch(_){state.textContent='Unable to load live usage.';clearUsage()}}
 keyInput.value=readKey();document.getElementById('settings-form').addEventListener('submit',function(event){event.preventDefault();const value=keyInput.value.trim();if(!value){keyStatus.textContent='Enter a Management key.';return}if(!writeKey(value)){keyStatus.textContent='Unable to save the Management key in this browser.';return}keyInput.value=value;keyStatus.textContent='Management key saved for this browser.';load()});document.getElementById('clear-key').addEventListener('click',function(){if(!removeKey()){keyStatus.textContent='Unable to clear the saved Management key.';return}keyInput.value='';keyStatus.textContent='Saved Management key cleared.';load()});document.getElementById('refresh').onclick=load;load();setInterval(load,5000)})()</script></body></html>`
 
@@ -742,7 +811,7 @@ func configure(raw []byte) error {
 }
 
 func pluginRegistration() registration {
-	return registration{SchemaVersion: pluginabi.SchemaVersion, Metadata: pluginapi.Metadata{Name: pluginID, Version: "0.1.5", Author: "CPA concurrency plugin", GitHubRepository: "https://github.com/router-for-me/CLIProxyAPI", ConfigFields: []pluginapi.ConfigField{
+	return registration{SchemaVersion: pluginabi.SchemaVersion, Metadata: pluginapi.Metadata{Name: pluginID, Version: "0.1.6", Author: "CPA concurrency plugin", GitHubRepository: "https://github.com/router-for-me/CLIProxyAPI", ConfigFields: []pluginapi.ConfigField{
 		{Name: "max_concurrency", Type: pluginapi.ConfigFieldTypeInteger, Description: "Hard per-account in-flight limit."},
 		{Name: "warm_reserved_slots", Type: pluginapi.ConfigFieldTypeInteger, Description: "Reserved slots for verified warm/strict affinity."},
 		{Name: "wait_timeout", Type: pluginapi.ConfigFieldTypeString, Description: "Bounded admission wait (Go duration, for example 50ms)."},

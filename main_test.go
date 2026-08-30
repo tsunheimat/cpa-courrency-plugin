@@ -63,7 +63,7 @@ func TestPluginRegistrationIncludesRequiredRepositoryMetadata(t *testing.T) {
 	if reg.Metadata.GitHubRepository == "" {
 		t.Fatal("plugin registration omitted GitHubRepository")
 	}
-	if reg.Metadata.Name != pluginID || reg.Metadata.Version != "0.1.5" || !reg.Capabilities.Scheduler || !reg.Capabilities.RequestInterceptorEnforcesAdmission {
+	if reg.Metadata.Name != pluginID || reg.Metadata.Version != "0.1.6" || !reg.Capabilities.Scheduler || !reg.Capabilities.RequestInterceptorEnforcesAdmission {
 		t.Fatalf("registration = %#v", reg)
 	}
 	if !reg.Capabilities.ManagementAPI {
@@ -131,13 +131,16 @@ func TestManagementRegistrationAndLiveSnapshotAreReadOnlyAndRedacted(t *testing.
 	if strings.Contains(string(serialized), `"key"`) {
 		t.Fatalf("snapshot JSON exposed authority key: %s", serialized)
 	}
-	for _, field := range []string{`"configured_limit"`, `"warm_reserved"`, `"available_capacity"`} {
+	for _, field := range []string{`"configured_limit"`, `"available_capacity"`} {
 		if strings.Contains(string(serialized), field) {
 			t.Fatalf("snapshot JSON exposed aggregate field %s: %s", field, serialized)
 		}
 	}
 	if got := len(state.leases); got != before {
 		t.Fatalf("snapshot mutated leases: before=%d after=%d", before, got)
+	}
+	if snapshot.Summary.Total.InFlight != 1 || snapshot.Summary.Total.Limit != 2 || snapshot.Summary.WarmReserved.InFlight != 0 || snapshot.Summary.WarmReserved.Reserved != 1 {
+		t.Fatalf("snapshot summary = %#v", snapshot.Summary)
 	}
 }
 
@@ -150,7 +153,7 @@ func TestManagementUIContainsAuthenticatedRefreshAndFailureStates(t *testing.T) 
 	if strings.Contains(body, `"in_flight":`) || strings.Contains(body, `"accounts_in_use":`) {
 		t.Fatal("unauthenticated resource embeds live allocation values")
 	}
-	for _, want := range []string{"/v0/management/plugins/cpa-account-concurrency/usage", "Settings", "type=\"password\"", "localStorage", "storageKey", "X-Management-Key", "credentials:'same-origin'", "method:'GET'", "Loading live usage", "Management key required.", "Unable to load live usage", "Management authentication required.", "stale", "aria-live", "Total (in-flight / limit)", "Warm reserved (in-flight / reserved)", "a.in_flight+' / '+a.limit", "a.warm_flight+' / '+a.reserved", "Save key", "Clear saved key", "removeItem", "setItem"} {
+	for _, want := range []string{"/v0/management/plugins/cpa-account-concurrency/usage", "Settings", "type=\"password\"", "localStorage", "storageKey", "X-Management-Key", "credentials:'same-origin'", "method:'GET'", "Loading live usage", "Management key required.", "Unable to load live usage", "Management authentication required.", "stale", "aria-live", "All available accounts", "summary-total", "summary-warm", "Total (in-flight / limit)", "Warm reserved (in-flight / reserved)", "a.in_flight+' / '+a.limit", "a.warm_flight+' / '+a.reserved", "Save key", "Clear saved key", "removeItem", "setItem"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("UI missing %q", want)
 		}
@@ -227,6 +230,58 @@ func TestHostAuthMetadataUsesIDFirstAndNameFallback(t *testing.T) {
 	}
 	if got := accountLabel(accountKey("cpa", "runtime.json"), metadata); got != "Account" {
 		t.Fatalf("unknown key fallback = %q", got)
+	}
+}
+
+func TestAuthEntryUnavailableUsesOnlyExplicitStatusMetadata(t *testing.T) {
+	future := time.Now().Add(time.Minute)
+	cases := []struct {
+		name  string
+		entry pluginapi.HostAuthFileEntry
+		want  bool
+	}{
+		{name: "disabled flag", entry: pluginapi.HostAuthFileEntry{Disabled: true}, want: true},
+		{name: "unavailable flag", entry: pluginapi.HostAuthFileEntry{Unavailable: true}, want: true},
+		{name: "unauthorized status", entry: pluginapi.HostAuthFileEntry{Status: "unauthorized"}, want: true},
+		{name: "http 401 message", entry: pluginapi.HostAuthFileEntry{StatusMessage: "HTTP 401 Unauthorized; re-login required"}, want: true},
+		{name: "failed status", entry: pluginapi.HostAuthFileEntry{Status: "authentication_error"}, want: true},
+		{name: "retry window", entry: pluginapi.HostAuthFileEntry{NextRetryAfter: future}, want: true},
+		{name: "usable status", entry: pluginapi.HostAuthFileEntry{Name: "account-401.json", Status: "active", StatusMessage: "ready"}, want: false},
+		{name: "empty status", entry: pluginapi.HostAuthFileEntry{Name: "401.json"}, want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := authEntryUnavailable(tc.entry); got != tc.want {
+				t.Fatalf("authEntryUnavailable(%+v) = %v, want %v", tc.entry, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestHostAuthMetadataFiltersUnavailableWithoutInspectingNames(t *testing.T) {
+	oldInvoker, oldTimeout := hostAuthInvoker, hostAuthTimeout
+	t.Cleanup(func() {
+		hostAuthInvoker, hostAuthTimeout = oldInvoker, oldTimeout
+		hostAuthCallState.mu.Lock()
+		hostAuthCallState.inFlight = false
+		hostAuthCallState.mu.Unlock()
+	})
+	entries := []pluginapi.HostAuthFileEntry{
+		{ID: "auth-401", Name: "usable-401.json", Status: "active"},
+		{ID: "auth-unauthorized", Name: "still-available.json", StatusMessage: "HTTP 401 Unauthorized"},
+		{ID: "auth-disabled", Name: "disabled-but-no-name-heuristic.json", Disabled: true},
+	}
+	raw := mustJSON(envelope{OK: true, Result: mustJSON(hostAuthListResponse{Files: entries})})
+	hostAuthInvoker = func() hostAuthListCallResult { return hostAuthListCallResult{raw: raw} }
+	metadata, err := hostAuthMetadata()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(metadata) != 1 {
+		t.Fatalf("filtered metadata = %#v, want one usable entry", metadata)
+	}
+	if _, ok := metadata[accountKey("cpa", "auth-401")]; !ok {
+		t.Fatalf("usable 401-named account was filtered: %#v", metadata)
 	}
 }
 
@@ -469,6 +524,9 @@ func TestAvailableIdleAccountsAreIncludedInSnapshot(t *testing.T) {
 	if snapshot.InFlight != 0 || !snapshot.Empty || snapshot.AccountsInUse != 0 {
 		t.Fatalf("idle aggregate = %#v", snapshot)
 	}
+	if snapshot.Summary.Total.InFlight != 0 || snapshot.Summary.Total.Limit != 4 || snapshot.Summary.WarmReserved.InFlight != 0 || snapshot.Summary.WarmReserved.Reserved != 2 {
+		t.Fatalf("idle summary = %#v", snapshot.Summary)
+	}
 	if len(snapshot.Accounts) != len(entries) {
 		t.Fatalf("idle accounts = %#v, want %d rows", snapshot.Accounts, len(entries))
 	}
@@ -508,6 +566,9 @@ func TestAvailableMixedActiveAndIdleAccountsAreIncludedInSnapshot(t *testing.T) 
 	}
 	if snapshot.InFlight != 1 || snapshot.Empty || snapshot.AccountsInUse != 1 {
 		t.Fatalf("mixed aggregate = %#v", snapshot)
+	}
+	if snapshot.Summary.Total.InFlight != 1 || snapshot.Summary.Total.Limit != 4 || snapshot.Summary.WarmReserved.InFlight != 0 || snapshot.Summary.WarmReserved.Reserved != 2 {
+		t.Fatalf("mixed summary = %#v", snapshot.Summary)
 	}
 	if len(snapshot.Accounts) != 2 {
 		t.Fatalf("mixed accounts = %#v, want active and idle rows", snapshot.Accounts)
@@ -575,6 +636,9 @@ func TestRedisAvailableAccountsUseHostListingAndShowZeroUsage(t *testing.T) {
 	if snapshot.InFlight != 2 || snapshot.WarmInFlight != 1 || len(snapshot.Accounts) != 2 {
 		t.Fatalf("redis snapshot = %#v", snapshot)
 	}
+	if snapshot.Summary.Total.InFlight != 2 || snapshot.Summary.Total.Limit != 10 || snapshot.Summary.WarmReserved.InFlight != 1 || snapshot.Summary.WarmReserved.Reserved != 4 {
+		t.Fatalf("redis summary = %#v", snapshot.Summary)
+	}
 	for _, account := range snapshot.Accounts {
 		switch account.Label {
 		case "active@example.com":
@@ -591,6 +655,71 @@ func TestRedisAvailableAccountsUseHostListingAndShowZeroUsage(t *testing.T) {
 	}
 	if len(fake.calls) != 2 {
 		t.Fatalf("redis snapshot calls = %v, want one per listed account", fake.calls)
+	}
+}
+
+func TestLocalSnapshotFiltersUnavailableRowsAndSumsAvailableOnly(t *testing.T) {
+	resetTestState()
+	oldInvoker, oldTimeout := hostAuthInvoker, hostAuthTimeout
+	t.Cleanup(func() { hostAuthInvoker, hostAuthTimeout = oldInvoker, oldTimeout; resetTestState() })
+	entries := []pluginapi.HostAuthFileEntry{
+		{ID: "local-a", Name: "usable-401.json", Status: "active"},
+		{ID: "local-b", Name: "needs-login.json", Status: "unauthorized"},
+		{ID: "local-c", Name: "disabled.json", Disabled: true},
+	}
+	raw := mustJSON(envelope{OK: true, Result: mustJSON(hostAuthListResponse{Files: entries})})
+	hostAuthInvoker = func() hostAuthListCallResult { return hostAuthListCallResult{raw: raw} }
+	state.mu.Lock()
+	state.cfg.MaxConcurrency, state.cfg.WarmReservedSlots = 3, 1
+	state.mu.Unlock()
+	a := state.authority.(*localAuthority)
+	lease, err := a.Acquire(context.Background(), accountKey("cpa", "local-a"), 3, 1, classWarm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = a.Release(context.Background(), lease) })
+	snapshot := readConcurrencySnapshot(context.Background())
+	if snapshot.Stale || len(snapshot.Accounts) != 1 {
+		t.Fatalf("local filtered snapshot = %#v", snapshot)
+	}
+	if snapshot.Accounts[0].Label != "usable-401.json" || snapshot.Accounts[0].InFlight != 1 {
+		t.Fatalf("local available row = %#v", snapshot.Accounts[0])
+	}
+	if snapshot.Summary.Total.InFlight != 1 || snapshot.Summary.Total.Limit != 3 || snapshot.Summary.WarmReserved.InFlight != 1 || snapshot.Summary.WarmReserved.Reserved != 1 {
+		t.Fatalf("local available summary = %#v", snapshot.Summary)
+	}
+}
+
+func TestRedisSnapshotFiltersUnavailableRowsAndSumsAvailableOnly(t *testing.T) {
+	resetTestState()
+	oldInvoker, oldTimeout := hostAuthInvoker, hostAuthTimeout
+	t.Cleanup(func() { hostAuthInvoker, hostAuthTimeout = oldInvoker, oldTimeout; resetTestState() })
+	entries := []pluginapi.HostAuthFileEntry{
+		{ID: "redis-a", Email: "usable@example.com", Status: "ready"},
+		{ID: "redis-b", Name: "unauthorized-401.json", StatusMessage: "HTTP 401; re-login required"},
+		{ID: "redis-c", Name: "disabled.json", Unavailable: true},
+	}
+	raw := mustJSON(envelope{OK: true, Result: mustJSON(hostAuthListResponse{Files: entries})})
+	hostAuthInvoker = func() hostAuthListCallResult { return hostAuthListCallResult{raw: raw} }
+	fake := &observabilityRedis{usage: make(map[string][2]int64)}
+	a := newRedisAuthority(fake, "filtered")
+	fake.usage[a.key(accountKey("cpa", "redis-a"))] = [2]int64{2, 1}
+	state.mu.Lock()
+	state.cfg.MaxConcurrency, state.cfg.WarmReservedSlots, state.cfg.Authority = 4, 2, "redis"
+	state.authority = a
+	state.mu.Unlock()
+	snapshot := readConcurrencySnapshot(context.Background())
+	if snapshot.Stale || len(snapshot.Accounts) != 1 {
+		t.Fatalf("redis filtered snapshot = %#v", snapshot)
+	}
+	if snapshot.Accounts[0].Label != "usable@example.com" || snapshot.Accounts[0].InFlight != 2 || snapshot.Accounts[0].WarmFlight != 1 {
+		t.Fatalf("redis available row = %#v", snapshot.Accounts[0])
+	}
+	if snapshot.Summary.Total.InFlight != 2 || snapshot.Summary.Total.Limit != 4 || snapshot.Summary.WarmReserved.InFlight != 1 || snapshot.Summary.WarmReserved.Reserved != 2 {
+		t.Fatalf("redis available summary = %#v", snapshot.Summary)
+	}
+	if len(fake.calls) != 1 {
+		t.Fatalf("redis snapshot queried filtered accounts: %v", fake.calls)
 	}
 }
 

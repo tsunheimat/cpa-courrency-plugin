@@ -47,7 +47,13 @@ cold and uses general capacity.
 The CPA concurrency management view reads the existing authenticated
 `/v0/management/plugins/cpa-account-concurrency/usage` route and uses CPA's
 stock `host.auth.list` callback to list every currently available account and
-read usage for each listed account through the selected authority. Idle
+read usage for each listed account through the selected authority. Entries are
+filtered only when that callback explicitly marks them disabled or unavailable,
+reports an authentication/authorization failure (including HTTP 401), or
+provides another explicit unusable status such as a future retry time. Account
+filenames, names, IDs, labels, paths, and credential JSON are never inspected
+for this decision; an available account whose name happens to contain `401`
+remains available. Idle
 available accounts show `0 / limit` usage, while active and idle accounts
 coexist. Labels prefer the auth email, then the CPA auth JSON filename/name,
 then a non-sensitive generic label; authority keys are never rendered. The
@@ -63,6 +69,13 @@ Settings area, stores it only in browser-local storage scoped to the current
 origin, and sends it as `X-Management-Key` on usage requests. The plugin never
 requests or stores auth JSON, tokens, passwords, or the browser's management
 key, and the browser makes no separate auth-files request.
+
+The view also shows a top-level **All available accounts** summary. Its Total
+value is the sum of every displayed row's in-flight count and limit; its Warm
+reserved value is the corresponding sum of warm in-flight count and reserved
+slots. Filtered/unavailable accounts do not contribute to either sum. The
+per-account table remains exactly `Account`, `Total (in-flight / limit)`, and
+`Warm reserved (in-flight / reserved)`.
 
 ## Authority modes
 
