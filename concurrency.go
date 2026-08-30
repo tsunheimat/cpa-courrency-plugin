@@ -15,6 +15,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
 const (
@@ -92,6 +94,32 @@ func (a *localAuthority) AccountSnapshots(_ context.Context, limit, reserved int
 	}
 	sort.Slice(accounts, func(i, j int) bool { return accounts[i].Key < accounts[j].Key })
 	return accounts, nil
+}
+
+// mergeAvailableAccountSnapshots adds every account returned by CPA's stock
+// auth metadata callback to the active usage rows. The local authority only
+// knows about accounts that have held a lease, so an available account with no
+// prior request must be synthesized with zero usage. Active buckets omitted by
+// a stale/incomplete metadata response remain visible with their hashed key.
+func mergeAvailableAccountSnapshots(active []AccountUsage, metadata map[string]pluginapi.HostAuthFileEntry, limit, reserved int) []AccountUsage {
+	accounts := make(map[string]AccountUsage, len(active)+len(metadata))
+	for _, usage := range active {
+		usage.Limit = limit
+		usage.Reserved = reserved
+		accounts[usage.Key] = usage
+	}
+	for key := range metadata {
+		if _, ok := accounts[key]; !ok {
+			accounts[key] = AccountUsage{Key: key, Limit: limit, Reserved: reserved}
+		}
+	}
+	merged := make([]AccountUsage, 0, len(accounts))
+	for _, usage := range accounts {
+		usage.Label = accountLabel(usage.Key, metadata)
+		merged = append(merged, usage)
+	}
+	sort.Slice(merged, func(i, j int) bool { return merged[i].Key < merged[j].Key })
+	return merged
 }
 
 type Authority interface {

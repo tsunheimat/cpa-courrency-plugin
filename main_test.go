@@ -63,7 +63,7 @@ func TestPluginRegistrationIncludesRequiredRepositoryMetadata(t *testing.T) {
 	if reg.Metadata.GitHubRepository == "" {
 		t.Fatal("plugin registration omitted GitHubRepository")
 	}
-	if reg.Metadata.Name != pluginID || reg.Metadata.Version != "0.1.4" || !reg.Capabilities.Scheduler || !reg.Capabilities.RequestInterceptorEnforcesAdmission {
+	if reg.Metadata.Name != pluginID || reg.Metadata.Version != "0.1.5" || !reg.Capabilities.Scheduler || !reg.Capabilities.RequestInterceptorEnforcesAdmission {
 		t.Fatalf("registration = %#v", reg)
 	}
 	if !reg.Capabilities.ManagementAPI {
@@ -434,6 +434,86 @@ func TestAccountUsageJSONUsesUIContract(t *testing.T) {
 		}
 		if got != want {
 			t.Fatalf("serialized %s = %#v, want %v", key, got, want)
+		}
+	}
+}
+
+func TestAvailableIdleAccountsAreIncludedInSnapshot(t *testing.T) {
+	resetTestState()
+	oldInvoker, oldTimeout := hostAuthInvoker, hostAuthTimeout
+	t.Cleanup(func() {
+		hostAuthInvoker, hostAuthTimeout = oldInvoker, oldTimeout
+		resetTestState()
+	})
+	entries := []pluginapi.HostAuthFileEntry{
+		{ID: "idle-a", Email: "idle-a@example.com"},
+		{ID: "idle-b", Name: "idle-b.json"},
+	}
+	raw, _ := json.Marshal(envelope{OK: true, Result: mustJSON(hostAuthListResponse{Files: entries})})
+	hostAuthInvoker = func() hostAuthListCallResult { return hostAuthListCallResult{raw: raw} }
+
+	snapshot := readConcurrencySnapshot(context.Background())
+	if snapshot.Stale || snapshot.Error != "" {
+		t.Fatalf("idle snapshot unexpectedly stale: %#v", snapshot)
+	}
+	if snapshot.InFlight != 0 || !snapshot.Empty || snapshot.AccountsInUse != 0 {
+		t.Fatalf("idle aggregate = %#v", snapshot)
+	}
+	if len(snapshot.Accounts) != len(entries) {
+		t.Fatalf("idle accounts = %#v, want %d rows", snapshot.Accounts, len(entries))
+	}
+	for _, account := range snapshot.Accounts {
+		if account.InFlight != 0 || account.WarmFlight != 0 || account.Limit != 2 || account.Reserved != 1 {
+			t.Fatalf("idle account usage = %#v", account)
+		}
+		if account.Label == "" || account.Label == account.Key {
+			t.Fatalf("idle account label = %#v", account)
+		}
+	}
+}
+
+func TestAvailableMixedActiveAndIdleAccountsAreIncludedInSnapshot(t *testing.T) {
+	resetTestState()
+	oldInvoker, oldTimeout := hostAuthInvoker, hostAuthTimeout
+	t.Cleanup(func() {
+		hostAuthInvoker, hostAuthTimeout = oldInvoker, oldTimeout
+		resetTestState()
+	})
+	entries := []pluginapi.HostAuthFileEntry{
+		{ID: "active", Email: "active@example.com"},
+		{ID: "idle", Email: "idle@example.com"},
+	}
+	raw, _ := json.Marshal(envelope{OK: true, Result: mustJSON(hostAuthListResponse{Files: entries})})
+	hostAuthInvoker = func() hostAuthListCallResult { return hostAuthListCallResult{raw: raw} }
+	authority := state.authority.(*localAuthority)
+	lease, err := authority.Acquire(context.Background(), accountKey("cpa", "active"), 2, 1, classCold)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = authority.Release(context.Background(), lease) })
+
+	snapshot := readConcurrencySnapshot(context.Background())
+	if snapshot.Stale || snapshot.Error != "" {
+		t.Fatalf("mixed snapshot unexpectedly stale: %#v", snapshot)
+	}
+	if snapshot.InFlight != 1 || snapshot.Empty || snapshot.AccountsInUse != 1 {
+		t.Fatalf("mixed aggregate = %#v", snapshot)
+	}
+	if len(snapshot.Accounts) != 2 {
+		t.Fatalf("mixed accounts = %#v, want active and idle rows", snapshot.Accounts)
+	}
+	for _, account := range snapshot.Accounts {
+		switch account.Label {
+		case "active@example.com":
+			if account.InFlight != 1 || account.WarmFlight != 0 {
+				t.Fatalf("active account usage = %#v", account)
+			}
+		case "idle@example.com":
+			if account.InFlight != 0 || account.WarmFlight != 0 {
+				t.Fatalf("idle account usage = %#v", account)
+			}
+		default:
+			t.Fatalf("unexpected account row = %#v", account)
 		}
 	}
 }

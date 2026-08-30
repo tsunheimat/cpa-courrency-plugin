@@ -328,18 +328,30 @@ func readConcurrencySnapshot(ctx context.Context) concurrencySnapshot {
 		}
 		s.InFlight, s.WarmInFlight, s.AccountsInUse = u.InFlight, u.WarmFlight, accounts
 		if listed, listErr := local.AccountSnapshots(ctx, cfg.MaxConcurrency, cfg.WarmReservedSlots); listErr == nil {
-			if len(listed) > 0 {
-				metadata, metadataErr := hostAuthMetadata()
-				if metadataErr != nil {
-					// Usage remains truthful; only labels fall back to hashed keys.
-					s.Stale = true
-					s.Error = "account labels unavailable"
-				}
+			metadata, metadataErr := hostAuthMetadata()
+			if metadataErr != nil {
+				// Usage remains truthful; only labels fall back to hashed keys. Without
+				// a successful stock listing we cannot claim that any idle accounts are
+				// currently available.
+				s.Stale = true
+				s.Error = "account labels unavailable"
 				for i := range listed {
-					listed[i].Label = accountLabel(listed[i].Key, metadata)
+					listed[i].Label = accountLabel(listed[i].Key, nil)
 				}
+				s.Accounts = listed
+			} else {
+				// The stock auth list is the source of truth for currently available
+				// accounts. Merge it with process-local usage so idle accounts render
+				// as 0 / limit while active buckets remain visible if metadata is stale.
+				for _, usage := range listed {
+					if _, ok := metadata[usage.Key]; !ok {
+						s.Stale = true
+						s.Error = "account labels unavailable"
+						break
+					}
+				}
+				s.Accounts = mergeAvailableAccountSnapshots(listed, metadata, cfg.MaxConcurrency, cfg.WarmReservedSlots)
 			}
-			s.Accounts = listed
 		}
 	} else {
 		// Redis authority has no account index; report configured state without
@@ -366,7 +378,7 @@ const managementHTMLAuthenticated = `<!doctype html>
 <style>body{font:16px system-ui,sans-serif;max-width:760px;margin:2rem auto;padding:0 1rem;color:#17202a}h1{font-size:1.5rem}.settings{border:1px solid #b8c2cc;border-radius:6px;padding:1rem;margin:1rem 0}.settings form{display:flex;gap:.5rem;flex-wrap:wrap;align-items:end}.settings label{display:flex;flex-direction:column;gap:.25rem;flex:1 1 280px}.settings input{font:inherit;padding:.45rem}.settings p{margin:.75rem 0 0;color:#4b5563;font-size:.9rem}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1rem}.metric{border:1px solid #b8c2cc;border-radius:6px;padding:1rem}.value{font-size:1.6rem;font-weight:650;margin-top:.25rem}.label{font-size:.85rem;color:#4b5563}#state{margin:1rem 0;padding:.75rem;border-left:4px solid #4b5563;background:#f3f4f6}button{padding:.5rem .75rem;font:inherit}table{width:100%;border-collapse:collapse;margin-top:1.25rem}th,td{text-align:left;border-bottom:1px solid #d1d5db;padding:.5rem;font-variant-numeric:tabular-nums}</style></head>
 <body><h1>CPA account concurrency</h1>
 <section class="settings" aria-labelledby="settings-title"><h2 id="settings-title">Settings</h2><form id="settings-form"><label for="management-key">CPA Management key<input id="management-key" name="management-key" type="password" autocomplete="off" spellcheck="false"></label><button id="save-key" type="submit">Save key</button><button id="clear-key" type="button">Clear saved key</button></form><p id="key-status" role="status" aria-live="polite"></p></section>
-<p><button id="refresh" type="button">Refresh now</button> <span id="updated" aria-live="polite"></span></p><div id="state" role="status" aria-live="polite">Loading live usage...</div><div class="grid" id="metrics"></div><table><caption>Active CPA accounts</caption><thead><tr><th scope="col">Account</th><th scope="col">Concurrency</th><th scope="col">Warm</th><th scope="col">Available</th></tr></thead><tbody id="accounts"></tbody></table>
+<p><button id="refresh" type="button">Refresh now</button> <span id="updated" aria-live="polite"></span></p><div id="state" role="status" aria-live="polite">Loading live usage...</div><div class="grid" id="metrics"></div><table><caption>Available CPA accounts</caption><thead><tr><th scope="col">Account</th><th scope="col">Concurrency</th><th scope="col">Warm</th><th scope="col">Available</th></tr></thead><tbody id="accounts"></tbody></table>
 <script>(function(){
 const api='/v0/management/plugins/cpa-account-concurrency/usage',storageKey='cpa-account-concurrency.management-key';
 const state=document.getElementById('state'),metrics=document.getElementById('metrics'),accounts=document.getElementById('accounts'),updated=document.getElementById('updated'),keyInput=document.getElementById('management-key'),keyStatus=document.getElementById('key-status');
@@ -703,7 +715,7 @@ func configure(raw []byte) error {
 }
 
 func pluginRegistration() registration {
-	return registration{SchemaVersion: pluginabi.SchemaVersion, Metadata: pluginapi.Metadata{Name: pluginID, Version: "0.1.4", Author: "CPA concurrency plugin", GitHubRepository: "https://github.com/router-for-me/CLIProxyAPI", ConfigFields: []pluginapi.ConfigField{
+	return registration{SchemaVersion: pluginabi.SchemaVersion, Metadata: pluginapi.Metadata{Name: pluginID, Version: "0.1.5", Author: "CPA concurrency plugin", GitHubRepository: "https://github.com/router-for-me/CLIProxyAPI", ConfigFields: []pluginapi.ConfigField{
 		{Name: "max_concurrency", Type: pluginapi.ConfigFieldTypeInteger, Description: "Hard per-account in-flight limit."},
 		{Name: "warm_reserved_slots", Type: pluginapi.ConfigFieldTypeInteger, Description: "Reserved slots for verified warm/strict affinity."},
 		{Name: "wait_timeout", Type: pluginapi.ConfigFieldTypeString, Description: "Bounded admission wait (Go duration, for example 50ms)."},
