@@ -33,7 +33,10 @@ account from stock CPA `Metadata["selected_auth_id"]` without requiring any
 CPA/CLIProxyAPI host source change. The account-level hard in-flight admission,
 fail-closed identity handling, lifecycle release, authenticated read-only usage
 UI, private registry/store model, and single-CPA `authority: local` configuration
-remain unchanged.
+remain unchanged. The UI's Settings area stores the CPA Management key only in
+browser-local storage for the current origin, sends it via `X-Management-Key`,
+and provides explicit save/update and clear actions; no key is stored by the
+plugin or host.
 
 The ZIP must contain the dynamic library at its root using this name:
 

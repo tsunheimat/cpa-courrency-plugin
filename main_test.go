@@ -137,14 +137,42 @@ func TestManagementUIContainsAuthenticatedRefreshAndFailureStates(t *testing.T) 
 	if strings.Contains(body, `"in_flight":`) || strings.Contains(body, `"accounts_in_use":`) {
 		t.Fatal("unauthenticated resource embeds live allocation values")
 	}
-	for _, want := range []string{"/v0/management/plugins/cpa-account-concurrency/usage", "credentials:'same-origin'", "method:'GET'", "Loading live usage", "Unable to load live usage", "Management authentication required.", "stale", "no active accounts", "aria-live", "a.in_flight+' / '+a.limit", "a.label||a.key"} {
+	for _, want := range []string{"/v0/management/plugins/cpa-account-concurrency/usage", "Settings", "type=\"password\"", "localStorage", "storageKey", "X-Management-Key", "credentials:'same-origin'", "method:'GET'", "Loading live usage", "Management key required.", "Unable to load live usage", "Management authentication required.", "stale", "no active accounts", "aria-live", "a.in_flight+' / '+a.limit", "a.label||a.key", "Save key", "Clear saved key", "removeItem", "setItem"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("UI missing %q", want)
 		}
 	}
-	for _, forbidden := range []string{"localStorage", "sessionStorage", "?management", "managementKey", "type=\"password\"", "Bearer test-secret", "/v0/management/auth-files"} {
+	for _, forbidden := range []string{"sessionStorage", "?management", "Bearer test-secret", "/v0/management/auth-files", "account-secret@example.com", "user@example.com"} {
 		if strings.Contains(body, forbidden) {
 			t.Errorf("UI contains forbidden credential material %q", forbidden)
+		}
+	}
+}
+
+func TestManagementUIKeyLifecycleAndAuthFailureHandling(t *testing.T) {
+	body := string(managementHTMLAuthenticated)
+	cases := []struct {
+		name string
+		want []string
+	}{
+		{name: "first run requires key", want: []string{"const authKey=readKey();if(!authKey)", "Management key required. Save a key in Settings"}},
+		{name: "save and reload use", want: []string{"localStorage.getItem(storageKey)", "localStorage.setItem(storageKey,value)", "keyInput.value=readKey()", "headers:{'X-Management-Key':authKey}"}},
+		{name: "update", want: []string{"keyInput.value.trim()", "writeKey(value)", "Management key saved for this browser."}},
+		{name: "clear", want: []string{"localStorage.removeItem(storageKey)", "keyInput.value=''", "Saved Management key cleared."}},
+		{name: "401 and 403", want: []string{"r.status===401||r.status===403", "Management authentication required."}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, want := range tc.want {
+				if !strings.Contains(body, want) {
+					t.Errorf("UI missing %q", want)
+				}
+			}
+		})
+	}
+	for _, forbidden := range []string{"?key=", "?management", "Authorization: Bearer", "console.log", "console.error"} {
+		if strings.Contains(body, forbidden) {
+			t.Errorf("UI contains unsafe credential path %q", forbidden)
 		}
 	}
 }

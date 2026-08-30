@@ -56,9 +56,11 @@ leaves usage counts available, marks the snapshot stale with an
 label fallback. This enrichment path never participates in admission. A
 timed-out callback remains the single in-flight worker; shutdown, reload, and
 reinitialization fence and join it before the host API is released or the
-plugin can be unloaded. The plugin never requests or stores auth JSON, tokens,
-passwords, or a plugin-specific management key, and the browser makes no
-separate auth-files request.
+plugin can be unloaded. The live UI accepts a CPA Management key in its
+Settings area, stores it only in browser-local storage scoped to the current
+origin, and sends it as `X-Management-Key` on usage requests. The plugin never
+requests or stores auth JSON, tokens, passwords, or the browser's management
+key, and the browser makes no separate auth-files request.
 
 ## Authority modes
 
