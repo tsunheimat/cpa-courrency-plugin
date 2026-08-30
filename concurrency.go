@@ -15,8 +15,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
 const (
@@ -49,8 +47,8 @@ type Usage struct {
 }
 
 type AccountUsage struct {
-	Key        string `json:"key"`
-	Label      string `json:"label,omitempty"`
+	Key        string `json:"-"`
+	Label      string `json:"label"`
 	Limit      int    `json:"limit"`
 	Reserved   int    `json:"reserved"`
 	InFlight   int    `json:"in_flight"`
@@ -94,32 +92,6 @@ func (a *localAuthority) AccountSnapshots(_ context.Context, limit, reserved int
 	}
 	sort.Slice(accounts, func(i, j int) bool { return accounts[i].Key < accounts[j].Key })
 	return accounts, nil
-}
-
-// mergeAvailableAccountSnapshots adds every account returned by CPA's stock
-// auth metadata callback to the active usage rows. The local authority only
-// knows about accounts that have held a lease, so an available account with no
-// prior request must be synthesized with zero usage. Active buckets omitted by
-// a stale/incomplete metadata response remain visible with their hashed key.
-func mergeAvailableAccountSnapshots(active []AccountUsage, metadata map[string]pluginapi.HostAuthFileEntry, limit, reserved int) []AccountUsage {
-	accounts := make(map[string]AccountUsage, len(active)+len(metadata))
-	for _, usage := range active {
-		usage.Limit = limit
-		usage.Reserved = reserved
-		accounts[usage.Key] = usage
-	}
-	for key := range metadata {
-		if _, ok := accounts[key]; !ok {
-			accounts[key] = AccountUsage{Key: key, Limit: limit, Reserved: reserved}
-		}
-	}
-	merged := make([]AccountUsage, 0, len(accounts))
-	for _, usage := range accounts {
-		usage.Label = accountLabel(usage.Key, metadata)
-		merged = append(merged, usage)
-	}
-	sort.Slice(merged, func(i, j int) bool { return merged[i].Key < merged[j].Key })
-	return merged
 }
 
 type Authority interface {
@@ -394,10 +366,20 @@ func (a *redisAuthority) Snapshot(ctx context.Context, account string, limit, re
 	if !ok || len(vals) < 2 {
 		return Usage{}, ErrAuthorityUnavailable
 	}
-	inflight, _ := toInt(vals[0])
-	warm, _ := toInt(vals[1])
+	inflight, ok := toInt(vals[0])
+	if !ok || inflight < 0 {
+		return Usage{}, ErrAuthorityUnavailable
+	}
+	warm, ok := toInt(vals[1])
+	if !ok || warm < 0 {
+		return Usage{}, ErrAuthorityUnavailable
+	}
 	if len(vals) >= 3 {
-		if fenced, ok := toInt(vals[2]); ok && fenced != 0 {
+		fenced, ok := toInt(vals[2])
+		if !ok {
+			return Usage{}, ErrAuthorityUnavailable
+		}
+		if fenced != 0 {
 			return Usage{}, ErrAuthorityUnavailable
 		}
 	}

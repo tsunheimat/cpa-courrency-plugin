@@ -34,6 +34,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -92,18 +93,18 @@ type managementRegistrationPayload struct {
 }
 
 type concurrencySnapshot struct {
-	ConfiguredLimit   int            `json:"configured_limit"`
-	WarmReserved      int            `json:"warm_reserved"`
-	InFlight          int            `json:"in_flight"`
-	WarmInFlight      int            `json:"warm_in_flight"`
-	GeneralInFlight   int            `json:"general_in_flight"`
-	GeneralCapacity   int            `json:"general_capacity"`
-	AvailableCapacity int            `json:"available_capacity"`
+	ConfiguredLimit   int            `json:"-"`
+	WarmReserved      int            `json:"-"`
+	InFlight          int            `json:"-"`
+	WarmInFlight      int            `json:"-"`
+	GeneralInFlight   int            `json:"-"`
+	GeneralCapacity   int            `json:"-"`
+	AvailableCapacity int            `json:"-"`
 	Authority         string         `json:"authority"`
 	AuthorityState    string         `json:"authority_state"`
-	CapacityState     string         `json:"capacity_state"`
-	AccountsInUse     int            `json:"accounts_in_use"`
-	Empty             bool           `json:"empty"`
+	CapacityState     string         `json:"-"`
+	AccountsInUse     int            `json:"-"`
+	Empty             bool           `json:"-"`
 	LastRefresh       time.Time      `json:"last_refresh"`
 	Stale             bool           `json:"stale"`
 	Error             string         `json:"error,omitempty"`
@@ -242,7 +243,7 @@ func hostAuthMetadata() (map[string]pluginapi.HostAuthFileEntry, error) {
 			id = canonicalAuthID(entry.Name)
 		}
 		if id == "" {
-			continue
+			return nil, errors.New("host auth list returned malformed entry")
 		}
 		byKey[accountKey("cpa", id)] = entry
 	}
@@ -281,7 +282,7 @@ func accountLabel(key string, metadata map[string]pluginapi.HostAuthFileEntry) s
 			return name
 		}
 	}
-	return key
+	return "Account"
 }
 
 func managementRegistrationResponse() managementRegistrationPayload {
@@ -320,6 +321,9 @@ func readConcurrencySnapshot(ctx context.Context) concurrencySnapshot {
 		s.Error = "concurrency authority unavailable"
 		return s
 	}
+	if _, ok := authority.(*redisAuthority); ok {
+		s.AuthorityState = "connected"
+	}
 	if local, ok := authority.(*localAuthority); ok {
 		u, accounts, err := local.AggregateSnapshot(ctx, cfg.MaxConcurrency, cfg.WarmReservedSlots)
 		if err != nil {
@@ -327,46 +331,69 @@ func readConcurrencySnapshot(ctx context.Context) concurrencySnapshot {
 			return s
 		}
 		s.InFlight, s.WarmInFlight, s.AccountsInUse = u.InFlight, u.WarmFlight, accounts
-		if listed, listErr := local.AccountSnapshots(ctx, cfg.MaxConcurrency, cfg.WarmReservedSlots); listErr == nil {
-			metadata, metadataErr := hostAuthMetadata()
-			if metadataErr != nil {
-				// Usage remains truthful; only labels fall back to hashed keys. Without
-				// a successful stock listing we cannot claim that any idle accounts are
-				// currently available.
-				s.Stale = true
-				s.Error = "account labels unavailable"
-				for i := range listed {
-					listed[i].Label = accountLabel(listed[i].Key, nil)
-				}
-				s.Accounts = listed
-			} else {
-				// The stock auth list is the source of truth for currently available
-				// accounts. Merge it with process-local usage so idle accounts render
-				// as 0 / limit while active buckets remain visible if metadata is stale.
-				for _, usage := range listed {
-					if _, ok := metadata[usage.Key]; !ok {
-						s.Stale = true
-						s.Error = "account labels unavailable"
-						break
-					}
-				}
-				s.Accounts = mergeAvailableAccountSnapshots(listed, metadata, cfg.MaxConcurrency, cfg.WarmReservedSlots)
-			}
-		}
-	} else {
-		// Redis authority has no account index; report configured state without
-		// fabricating usage or exposing key material.
-		s.AuthorityState = "connected"
 	}
-	s.GeneralInFlight = maxInt(0, s.InFlight-s.WarmInFlight)
-	s.AvailableCapacity = maxInt(0, s.ConfiguredLimit-s.InFlight)
-	s.Empty = s.InFlight == 0
-	if s.Empty {
-		s.CapacityState = "empty"
-	} else if s.AvailableCapacity == 0 {
-		s.CapacityState = "full"
+	// The stock host listing is the sole available-account index for every
+	// authority. It must succeed before any account can be rendered as
+	// available; authority usage is then read independently for each listed key.
+	metadata, metadataErr := hostAuthMetadata()
+	if metadataErr != nil {
+		s.Stale = true
+		s.Error = "account list unavailable"
+	} else {
+		accounts, usage, usageErr := availableAccountSnapshots(ctx, authority, metadata, cfg.MaxConcurrency, cfg.WarmReservedSlots)
+		if usageErr != nil {
+			s.Stale = true
+			s.Error = "concurrency authority unavailable"
+			s.AuthorityState = "unavailable"
+			s.CapacityState = "unavailable"
+		} else {
+			s.Accounts = accounts
+			s.InFlight, s.WarmInFlight, s.AccountsInUse = usage.InFlight, usage.WarmFlight, countActiveAccounts(accounts)
+		}
+	}
+	if !s.Stale {
+		s.GeneralInFlight = maxInt(0, s.InFlight-s.WarmInFlight)
+		s.Empty = s.InFlight == 0
+		if s.Empty {
+			s.CapacityState = "empty"
+		}
 	}
 	return s
+}
+
+// availableAccountSnapshots reads usage only for accounts successfully returned
+// by the host listing. A failed authority read is not converted to zero usage.
+func availableAccountSnapshots(ctx context.Context, authority Authority, metadata map[string]pluginapi.HostAuthFileEntry, limit, reserved int) ([]AccountUsage, Usage, error) {
+	ctx, cancel := ensureAuthorityContext(ctx)
+	defer cancel()
+	keys := make([]string, 0, len(metadata))
+	for key := range metadata {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	accounts := make([]AccountUsage, 0, len(keys))
+	var total Usage
+	total.Limit, total.Reserved = limit, reserved
+	for _, key := range keys {
+		u, err := authority.Snapshot(ctx, key, limit, reserved)
+		if err != nil {
+			return nil, Usage{}, err
+		}
+		accounts = append(accounts, AccountUsage{Key: key, Label: accountLabel(key, metadata), Limit: limit, Reserved: reserved, InFlight: u.InFlight, WarmFlight: u.WarmFlight})
+		total.InFlight += u.InFlight
+		total.WarmFlight += u.WarmFlight
+	}
+	return accounts, total, nil
+}
+
+func countActiveAccounts(accounts []AccountUsage) int {
+	count := 0
+	for _, account := range accounts {
+		if account.InFlight > 0 {
+			count++
+		}
+	}
+	return count
 }
 
 // managementHTMLAuthenticated is a static resource. The browser stores the
@@ -375,19 +402,19 @@ func readConcurrencySnapshot(ctx context.Context) concurrencySnapshot {
 // into metrics/errors.
 const managementHTMLAuthenticated = `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>CPA concurrency</title>
-<style>body{font:16px system-ui,sans-serif;max-width:760px;margin:2rem auto;padding:0 1rem;color:#17202a}h1{font-size:1.5rem}.settings{border:1px solid #b8c2cc;border-radius:6px;padding:1rem;margin:1rem 0}.settings form{display:flex;gap:.5rem;flex-wrap:wrap;align-items:end}.settings label{display:flex;flex-direction:column;gap:.25rem;flex:1 1 280px}.settings input{font:inherit;padding:.45rem}.settings p{margin:.75rem 0 0;color:#4b5563;font-size:.9rem}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1rem}.metric{border:1px solid #b8c2cc;border-radius:6px;padding:1rem}.value{font-size:1.6rem;font-weight:650;margin-top:.25rem}.label{font-size:.85rem;color:#4b5563}#state{margin:1rem 0;padding:.75rem;border-left:4px solid #4b5563;background:#f3f4f6}button{padding:.5rem .75rem;font:inherit}table{width:100%;border-collapse:collapse;margin-top:1.25rem}th,td{text-align:left;border-bottom:1px solid #d1d5db;padding:.5rem;font-variant-numeric:tabular-nums}</style></head>
+<style>body{font:16px system-ui,sans-serif;max-width:760px;margin:2rem auto;padding:0 1rem;color:#17202a}h1{font-size:1.5rem}.settings{border:1px solid #b8c2cc;border-radius:6px;padding:1rem;margin:1rem 0}.settings form{display:flex;gap:.5rem;flex-wrap:wrap;align-items:end}.settings label{display:flex;flex-direction:column;gap:.25rem;flex:1 1 280px}.settings input{font:inherit;padding:.45rem}.settings p{margin:.75rem 0 0;color:#4b5563;font-size:.9rem}#state{margin:1rem 0;padding:.75rem;border-left:4px solid #4b5563;background:#f3f4f6}button{padding:.5rem .75rem;font:inherit}table{width:100%;border-collapse:collapse;margin-top:1.25rem}th,td{text-align:left;border-bottom:1px solid #d1d5db;padding:.5rem;font-variant-numeric:tabular-nums}th:nth-child(n+2),td:nth-child(n+2){text-align:right}</style></head>
 <body><h1>CPA account concurrency</h1>
 <section class="settings" aria-labelledby="settings-title"><h2 id="settings-title">Settings</h2><form id="settings-form"><label for="management-key">CPA Management key<input id="management-key" name="management-key" type="password" autocomplete="off" spellcheck="false"></label><button id="save-key" type="submit">Save key</button><button id="clear-key" type="button">Clear saved key</button></form><p id="key-status" role="status" aria-live="polite"></p></section>
-<p><button id="refresh" type="button">Refresh now</button> <span id="updated" aria-live="polite"></span></p><div id="state" role="status" aria-live="polite">Loading live usage...</div><div class="grid" id="metrics"></div><table><caption>Available CPA accounts</caption><thead><tr><th scope="col">Account</th><th scope="col">Concurrency</th><th scope="col">Warm</th><th scope="col">Available</th></tr></thead><tbody id="accounts"></tbody></table>
+<p><button id="refresh" type="button">Refresh now</button> <span id="updated" aria-live="polite"></span></p><div id="state" role="status" aria-live="polite">Loading live usage...</div><table><caption>Available CPA accounts</caption><thead><tr><th scope="col">Account</th><th scope="col">Total (in-flight / limit)</th><th scope="col">Warm reserved (in-flight / reserved)</th></tr></thead><tbody id="accounts"></tbody></table>
 <script>(function(){
 const api='/v0/management/plugins/cpa-account-concurrency/usage',storageKey='cpa-account-concurrency.management-key';
-const state=document.getElementById('state'),metrics=document.getElementById('metrics'),accounts=document.getElementById('accounts'),updated=document.getElementById('updated'),keyInput=document.getElementById('management-key'),keyStatus=document.getElementById('key-status');
+const state=document.getElementById('state'),accounts=document.getElementById('accounts'),updated=document.getElementById('updated'),keyInput=document.getElementById('management-key'),keyStatus=document.getElementById('key-status');
 const esc=v=>String(v??'').replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[c]));
 function readKey(){try{return localStorage.getItem(storageKey)||''}catch(_){return ''}}
 function writeKey(value){try{localStorage.setItem(storageKey,value);return true}catch(_){return false}}
 function removeKey(){try{localStorage.removeItem(storageKey);return true}catch(_){return false}}
-function clearUsage(){metrics.innerHTML='';accounts.innerHTML='';updated.textContent=''}
-function render(d){const labels=[['Configured limit','configured_limit'],['Warm reserved','warm_reserved'],['In flight','in_flight'],['Warm in flight','warm_in_flight'],['General in flight','general_in_flight'],['Available capacity','available_capacity']];metrics.innerHTML=labels.map(x=>'<div class="metric"><div class="label">'+x[0]+'</div><div class="value">'+(d[x[1]]??'--')+'</div></div>').join('');accounts.innerHTML=(d.accounts||[]).map(a=>'<tr><td>'+esc(a.label||a.key)+'</td><td>'+a.in_flight+' / '+a.limit+'</td><td>'+a.warm_flight+'</td><td>'+Math.max(0,a.limit-a.in_flight)+'</td></tr>').join('');let msg='Authority: '+(d.authority_state||'unknown')+'; capacity: '+(d.capacity_state||'unknown');if(d.empty)msg+='; no active accounts';if(d.stale)msg+='; stale';if(d.error)msg+='; '+d.error;state.textContent=msg;updated.textContent=d.last_refresh?'Last refresh '+new Date(d.last_refresh).toLocaleTimeString():''}
+function clearUsage(){accounts.innerHTML='';updated.textContent=''}
+function render(d){accounts.innerHTML=(d.accounts||[]).map(a=>'<tr><td>'+esc(a.label||'Account')+'</td><td>'+a.in_flight+' / '+a.limit+'</td><td>'+a.warm_flight+' / '+a.reserved+'</td></tr>').join('');let msg='Authority: '+(d.authority_state||'unknown');if(d.stale)msg+='; stale';if(d.error)msg+='; '+d.error;state.textContent=msg;updated.textContent=d.last_refresh?'Last refresh '+new Date(d.last_refresh).toLocaleTimeString():''}
 async function load(){const authKey=readKey();if(!authKey){state.textContent='Management key required. Save a key in Settings to load live usage.';clearUsage();return}state.textContent='Loading live usage...';try{const r=await fetch(api,{method:'GET',credentials:'same-origin',cache:'no-store',headers:{'X-Management-Key':authKey}});if(!r.ok){if(r.status===401||r.status===403){state.textContent='Management authentication required.'}else{state.textContent='Unable to load live usage.'}clearUsage();return}render(await r.json())}catch(_){state.textContent='Unable to load live usage.';clearUsage()}}
 keyInput.value=readKey();document.getElementById('settings-form').addEventListener('submit',function(event){event.preventDefault();const value=keyInput.value.trim();if(!value){keyStatus.textContent='Enter a Management key.';return}if(!writeKey(value)){keyStatus.textContent='Unable to save the Management key in this browser.';return}keyInput.value=value;keyStatus.textContent='Management key saved for this browser.';load()});document.getElementById('clear-key').addEventListener('click',function(){if(!removeKey()){keyStatus.textContent='Unable to clear the saved Management key.';return}keyInput.value='';keyStatus.textContent='Saved Management key cleared.';load()});document.getElementById('refresh').onclick=load;load();setInterval(load,5000)})()</script></body></html>`
 

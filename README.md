@@ -47,15 +47,15 @@ cold and uses general capacity.
 The CPA concurrency management view reads the existing authenticated
 `/v0/management/plugins/cpa-account-concurrency/usage` route and uses CPA's
 stock `host.auth.list` callback to list every currently available account and
-enrich each hashed usage bucket with redacted account metadata. Idle available
-accounts show `0 / limit` usage, while active buckets remain visible if label
-metadata is stale or incomplete. Labels prefer the auth email, then the CPA auth
-JSON filename/name, and finally the existing hashed account key. Each account
-shows its own `in_flight / limit` value (for example, `1 / 2`). The callback is
-bounded; timeout, callback error, malformed data, or an empty/unusable list
-leaves usage counts available, marks the snapshot stale with an
-`account labels unavailable` error, and uses the hashed key as the truthful
-label fallback. This enrichment path never participates in admission. A
+read usage for each listed account through the selected authority. Idle
+available accounts show `0 / limit` usage, while active and idle accounts
+coexist. Labels prefer the auth email, then the CPA auth JSON filename/name,
+then a non-sensitive generic label; authority keys are never rendered. The
+callback is bounded; timeout, callback error, malformed data, or an
+empty/unusable list leaves the account list empty and marks the snapshot stale.
+Authority read failures likewise mark the snapshot stale without converting an
+unknown usage value to zero. This enrichment path never participates in
+admission. A
 timed-out callback remains the single in-flight worker; shutdown, reload, and
 reinitialization fence and join it before the host API is released or the
 plugin can be unloaded. The live UI accepts a CPA Management key in its

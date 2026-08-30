@@ -73,6 +73,11 @@ func TestPluginRegistrationIncludesRequiredRepositoryMetadata(t *testing.T) {
 
 func TestManagementRegistrationAndLiveSnapshotAreReadOnlyAndRedacted(t *testing.T) {
 	resetTestState()
+	oldInvoker, oldTimeout := hostAuthInvoker, hostAuthTimeout
+	t.Cleanup(func() { hostAuthInvoker, hostAuthTimeout = oldInvoker, oldTimeout; resetTestState() })
+	entry := pluginapi.HostAuthFileEntry{ID: "account-secret@example.com", Name: "account.json"}
+	rawList, _ := json.Marshal(envelope{OK: true, Result: mustJSON(hostAuthListResponse{Files: []pluginapi.HostAuthFileEntry{entry}})})
+	hostAuthInvoker = func() hostAuthListCallResult { return hostAuthListCallResult{raw: rawList} }
 	reg, err := handleMethod(pluginabi.MethodManagementRegister, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -105,22 +110,30 @@ func TestManagementRegistrationAndLiveSnapshotAreReadOnlyAndRedacted(t *testing.
 	if err := json.Unmarshal(managementResp.Body, &snapshot); err != nil {
 		t.Fatal(err)
 	}
-	if snapshot.InFlight != 1 || snapshot.ConfiguredLimit != 2 || snapshot.WarmReserved != 1 || snapshot.AvailableCapacity != 1 {
+	if snapshot.Stale {
 		t.Fatalf("snapshot = %#v", snapshot)
 	}
 	if len(snapshot.Accounts) != 1 {
 		t.Fatalf("snapshot accounts = %#v, want one active account", snapshot.Accounts)
 	}
-	if got := snapshot.Accounts[0]; got.Key == "" || got.Key == "account-secret@example.com" || got.Limit != 2 || got.Reserved != 1 || got.InFlight != 1 || got.WarmFlight != 0 {
+	if got := snapshot.Accounts[0]; got.Label != "account.json" || got.Limit != 2 || got.Reserved != 1 || got.InFlight != 1 || got.WarmFlight != 0 {
 		t.Fatalf("snapshot account = %#v", got)
 	}
 	serialized, err := json.Marshal(snapshot)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, field := range []string{`"key"`, `"limit"`, `"reserved"`, `"in_flight"`, `"warm_flight"`} {
+	for _, field := range []string{`"label"`, `"limit"`, `"reserved"`, `"in_flight"`, `"warm_flight"`} {
 		if !strings.Contains(string(serialized), field) {
 			t.Fatalf("snapshot JSON missing nested field %s: %s", field, serialized)
+		}
+	}
+	if strings.Contains(string(serialized), `"key"`) {
+		t.Fatalf("snapshot JSON exposed authority key: %s", serialized)
+	}
+	for _, field := range []string{`"configured_limit"`, `"warm_reserved"`, `"available_capacity"`} {
+		if strings.Contains(string(serialized), field) {
+			t.Fatalf("snapshot JSON exposed aggregate field %s: %s", field, serialized)
 		}
 	}
 	if got := len(state.leases); got != before {
@@ -137,12 +150,12 @@ func TestManagementUIContainsAuthenticatedRefreshAndFailureStates(t *testing.T) 
 	if strings.Contains(body, `"in_flight":`) || strings.Contains(body, `"accounts_in_use":`) {
 		t.Fatal("unauthenticated resource embeds live allocation values")
 	}
-	for _, want := range []string{"/v0/management/plugins/cpa-account-concurrency/usage", "Settings", "type=\"password\"", "localStorage", "storageKey", "X-Management-Key", "credentials:'same-origin'", "method:'GET'", "Loading live usage", "Management key required.", "Unable to load live usage", "Management authentication required.", "stale", "no active accounts", "aria-live", "a.in_flight+' / '+a.limit", "a.label||a.key", "Save key", "Clear saved key", "removeItem", "setItem"} {
+	for _, want := range []string{"/v0/management/plugins/cpa-account-concurrency/usage", "Settings", "type=\"password\"", "localStorage", "storageKey", "X-Management-Key", "credentials:'same-origin'", "method:'GET'", "Loading live usage", "Management key required.", "Unable to load live usage", "Management authentication required.", "stale", "aria-live", "Total (in-flight / limit)", "Warm reserved (in-flight / reserved)", "a.in_flight+' / '+a.limit", "a.warm_flight+' / '+a.reserved", "Save key", "Clear saved key", "removeItem", "setItem"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("UI missing %q", want)
 		}
 	}
-	for _, forbidden := range []string{"sessionStorage", "?management", "Bearer test-secret", "/v0/management/auth-files", "account-secret@example.com", "user@example.com"} {
+	for _, forbidden := range []string{"sessionStorage", "?management", "Bearer test-secret", "/v0/management/auth-files", "account-secret@example.com", "user@example.com", "available_capacity", "Configured limit", "In flight", "Warm in flight", "General in flight"} {
 		if strings.Contains(body, forbidden) {
 			t.Errorf("UI contains forbidden credential material %q", forbidden)
 		}
@@ -185,8 +198,8 @@ func TestAccountLabelPrecedence(t *testing.T) {
 	if got := accountLabel(key, map[string]pluginapi.HostAuthFileEntry{key: {Name: "account.json"}}); got != "account.json" {
 		t.Fatalf("name label = %q", got)
 	}
-	if got := accountLabel(key, nil); got != key {
-		t.Fatalf("hash fallback label = %q", got)
+	if got := accountLabel(key, nil); got != "Account" {
+		t.Fatalf("safe fallback label = %q", got)
 	}
 }
 
@@ -212,8 +225,8 @@ func TestHostAuthMetadataUsesIDFirstAndNameFallback(t *testing.T) {
 	if got := accountLabel(accountKey("cpa", "disk.json"), metadata); got != "disk@example.com" {
 		t.Fatalf("Name fallback mapping = %q", got)
 	}
-	if got := accountLabel(accountKey("cpa", "runtime.json"), metadata); got != accountKey("cpa", "runtime.json") {
-		t.Fatalf("Name must not override ID mapping = %q", got)
+	if got := accountLabel(accountKey("cpa", "runtime.json"), metadata); got != "Account" {
+		t.Fatalf("unknown key fallback = %q", got)
 	}
 }
 
@@ -421,20 +434,17 @@ func TestAccountUsageJSONUsesUIContract(t *testing.T) {
 	if err := json.Unmarshal(raw, &fields); err != nil {
 		t.Fatal(err)
 	}
-	for key, want := range map[string]float64{"key": 0, "limit": 4, "reserved": 1, "in_flight": 2, "warm_flight": 1} {
+	for key, want := range map[string]float64{"limit": 4, "reserved": 1, "in_flight": 2, "warm_flight": 1} {
 		got, ok := fields[key]
 		if !ok {
 			t.Fatalf("serialized AccountUsage missing %q: %s", key, raw)
 		}
-		if key == "key" {
-			if got != "acct-hash" {
-				t.Fatalf("serialized key = %#v", got)
-			}
-			continue
-		}
 		if got != want {
 			t.Fatalf("serialized %s = %#v, want %v", key, got, want)
 		}
+	}
+	if _, ok := fields["key"]; ok {
+		t.Fatalf("serialized AccountUsage exposed authority key: %s", raw)
 	}
 }
 
@@ -515,6 +525,110 @@ func TestAvailableMixedActiveAndIdleAccountsAreIncludedInSnapshot(t *testing.T) 
 		default:
 			t.Fatalf("unexpected account row = %#v", account)
 		}
+	}
+}
+
+type observabilityRedis struct {
+	mu    sync.Mutex
+	usage map[string][2]int64
+	calls []string
+	err   error
+}
+
+func (r *observabilityRedis) Eval(_ context.Context, script string, keys []string, _ ...any) (any, error) {
+	if script != redisSnapshotScript {
+		return []any{int64(0), int64(0), int64(0)}, nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.err != nil {
+		return nil, r.err
+	}
+	if len(keys) != 1 {
+		return nil, errors.New("snapshot key missing")
+	}
+	r.calls = append(r.calls, keys[0])
+	u := r.usage[keys[0]]
+	return []any{u[0], u[1], int64(0)}, nil
+}
+
+func TestRedisAvailableAccountsUseHostListingAndShowZeroUsage(t *testing.T) {
+	resetTestState()
+	oldInvoker, oldTimeout := hostAuthInvoker, hostAuthTimeout
+	t.Cleanup(func() { hostAuthInvoker, hostAuthTimeout = oldInvoker, oldTimeout; resetTestState() })
+	entries := []pluginapi.HostAuthFileEntry{{ID: "redis-active", Email: "active@example.com"}, {ID: "redis-idle", Name: "idle.json"}}
+	raw, _ := json.Marshal(envelope{OK: true, Result: mustJSON(hostAuthListResponse{Files: entries})})
+	hostAuthInvoker = func() hostAuthListCallResult { return hostAuthListCallResult{raw: raw} }
+	fake := &observabilityRedis{usage: make(map[string][2]int64)}
+	a := newRedisAuthority(fake, "obs")
+	activeKey := a.key(accountKey("cpa", "redis-active"))
+	fake.usage[activeKey] = [2]int64{2, 1}
+	state.mu.Lock()
+	state.cfg.MaxConcurrency, state.cfg.WarmReservedSlots, state.cfg.Authority = 5, 2, "redis"
+	state.authority = a
+	state.mu.Unlock()
+
+	snapshot := readConcurrencySnapshot(context.Background())
+	if snapshot.Stale || snapshot.Error != "" {
+		t.Fatalf("redis snapshot unexpectedly stale: %#v", snapshot)
+	}
+	if snapshot.InFlight != 2 || snapshot.WarmInFlight != 1 || len(snapshot.Accounts) != 2 {
+		t.Fatalf("redis snapshot = %#v", snapshot)
+	}
+	for _, account := range snapshot.Accounts {
+		switch account.Label {
+		case "active@example.com":
+			if account.InFlight != 2 || account.WarmFlight != 1 || account.Limit != 5 || account.Reserved != 2 {
+				t.Fatalf("redis active row = %#v", account)
+			}
+		case "idle.json":
+			if account.InFlight != 0 || account.WarmFlight != 0 {
+				t.Fatalf("redis idle row = %#v", account)
+			}
+		default:
+			t.Fatalf("unexpected redis row = %#v", account)
+		}
+	}
+	if len(fake.calls) != 2 {
+		t.Fatalf("redis snapshot calls = %v, want one per listed account", fake.calls)
+	}
+}
+
+func TestAccountListFailureNeverClaimsAvailableRows(t *testing.T) {
+	resetTestState()
+	oldInvoker, oldTimeout := hostAuthInvoker, hostAuthTimeout
+	t.Cleanup(func() { hostAuthInvoker, hostAuthTimeout = oldInvoker, oldTimeout; resetTestState() })
+	hostAuthInvoker = func() hostAuthListCallResult { return hostAuthListCallResult{code: 7} }
+	a := state.authority
+	lease, err := a.Acquire(context.Background(), accountKey("cpa", "hidden"), 2, 1, classWarm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = a.Release(context.Background(), lease) })
+	snapshot := readConcurrencySnapshot(context.Background())
+	if !snapshot.Stale || snapshot.Error == "" || len(snapshot.Accounts) != 0 {
+		t.Fatalf("failed host list snapshot = %#v", snapshot)
+	}
+	if snapshot.InFlight != 1 || snapshot.WarmInFlight != 1 {
+		t.Fatalf("local usage was not retained truthfully = %#v", snapshot)
+	}
+}
+
+func TestRedisAuthorityReadFailureLeavesRowsUnknown(t *testing.T) {
+	resetTestState()
+	oldInvoker, oldTimeout := hostAuthInvoker, hostAuthTimeout
+	t.Cleanup(func() { hostAuthInvoker, hostAuthTimeout = oldInvoker, oldTimeout; resetTestState() })
+	entry := pluginapi.HostAuthFileEntry{ID: "redis-fail", Name: "redis-fail.json"}
+	raw, _ := json.Marshal(envelope{OK: true, Result: mustJSON(hostAuthListResponse{Files: []pluginapi.HostAuthFileEntry{entry}})})
+	hostAuthInvoker = func() hostAuthListCallResult { return hostAuthListCallResult{raw: raw} }
+	a := newRedisAuthority(&observabilityRedis{usage: make(map[string][2]int64), err: errors.New("redis down")}, "obs")
+	state.mu.Lock()
+	state.cfg.Authority = "redis"
+	state.authority = a
+	state.mu.Unlock()
+	snapshot := readConcurrencySnapshot(context.Background())
+	if !snapshot.Stale || snapshot.AuthorityState != "unavailable" || len(snapshot.Accounts) != 0 {
+		t.Fatalf("failed authority snapshot = %#v", snapshot)
 	}
 }
 
