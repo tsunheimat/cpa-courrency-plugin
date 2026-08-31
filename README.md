@@ -1,106 +1,91 @@
-# CPA account concurrency plugin
+# CPA Account Concurrency Plugin
 
-This plugin adds sub2api-like protection for CPA Pro accounts. It is a C ABI
-dynamic-library plugin and uses the CPA request-interceptor and request-lifecycle
-hooks. The protected resource is the stable CPA auth ID. IDs are canonicalized
-by trimming surrounding whitespace (case and interior characters remain
-significant), then hashed before they are used as authority keys and never
-returned in errors or logs. Duplicate scheduler candidates collapse after
-this canonicalization.
+A native CLIProxyAPI plugin that provides cache-aware, per-account hard in-flight
+concurrency admission for CPA Pro accounts.
+
+The plugin uses the official CLIProxyAPI dynamic-library plugin ABI and request
+lifecycle hooks. It limits upstream calls per selected CPA account, returns
+structured local capacity errors before provider I/O, and provides an
+authenticated Management Center view of account usage.
+
+## Features
+
+- Per-account hard in-flight concurrency limits.
+- Local authority for a single CPA process.
+- Optional Redis authority for multiple CPA processes sharing the same account
+  pool.
+- Cache-aware warm/general capacity handling.
+- Stable selected-auth identity and failover-safe lease lifecycle.
+- Bounded admission wait; no unbounded internal request queue.
+- Fail-closed behavior when the configured authority is unavailable or a lease
+  cannot be renewed safely.
+- Authenticated Management Center usage view with explicit unavailable-auth
+  filtering.
+- An **All available accounts** summary calculated only from displayed rows.
+- No credential JSON, provider token, password, authority key, or Management key
+  is returned by the plugin API or rendered in the usage table.
+
+## Compatibility
+
+- Host: CLIProxyAPI/CPA with the native plugin ABI and request-lifecycle support.
+- Plugin ID: `cpa-account-concurrency`.
+- Current release: `v0.1.6`.
+- Published binary target in this repository: **Linux amd64**.
+
+Other operating systems and architectures are not published by the current
+release. Do not install the Linux `.so` on another platform.
 
 ## Configuration
+
+Enable the global plugin system and configure the plugin in the normal
+CLIProxyAPI configuration:
 
 ```yaml
 plugins:
   enabled: true
+  dir: plugins
   configs:
     cpa-account-concurrency:
       enabled: true
+      admission-enforcing: true
       priority: 100
       max_concurrency: 2
       warm_reserved_slots: 0 # 0 selects the recommended formula
       wait_timeout: 50ms
       authority: local
       redis_prefix: cpa:concurrency
-      # redis_addr: 127.0.0.1:6379 # required for authority: redis
+      # Required when authority is redis:
+      # redis_addr: 127.0.0.1:6379
+      # redis_password: example-value
+      # redis_db: 0
 ```
 
-`max_concurrency` is required to be at least one. The recommended reservation
-for a hard limit `C` is `W=0` for `C<=1`, otherwise
-`min(C-1,max(1,ceil(0.20*C)))`; general capacity is `G=C-W`. Warm/strict
-affinity requests can consume warm or general capacity. Cold requests (including
-an unverified `prompt_cache_key`-style hint) can consume only general capacity.
+`max_concurrency` must be at least one. For a hard limit `C`, the recommended
+warm reservation is `W=0` for `C<=1`; otherwise it is
+`min(C-1, max(1, ceil(0.20*C)))`. General capacity is `G=C-W`.
 
-Admission waits at most `wait_timeout`; there is no unbounded internal queue.
-The scheduler chooses the least-loaded currently available candidate, with
-stable candidate-order tie breaking. A strict affinity hint (`pinned_auth_id`,
-`session_auth_id`, or `affinity_auth_id`) is retained when that account is
-available. `selected_auth_id` is selection state published by CPA on every
-attempt and is never sufficient for warm classification. A host-provided
-`cache_auth_id` is warm only when paired with `cache_verified: true`; the normal
-CPA session-affinity selector publishes that pair only on a validated cache hit.
-On a retry/failover, the binding must match the selected auth or the attempt is
-cold and uses general capacity.
+Set `authority: local` for one CPA process. Use `authority: redis` only when
+all participating CPA processes point at the same Redis authority and use a
+consistent `redis_prefix`. Keep Redis credentials in the service secret
+configuration; never commit them to this repository.
 
-## Management observability
+`admission-enforcing: true` is intentional. It makes plugin loading,
+registration, incompatible host schemas, callback failures, and authority
+failures terminate the request with the typed local 503 error instead of
+silently bypassing the configured hard limit.
 
-The CPA concurrency management view reads the existing authenticated
-`/v0/management/plugins/cpa-account-concurrency/usage` route and uses CPA's
-stock `host.auth.list` callback to list every currently available account and
-read usage for each listed account through the selected authority. Entries are
-filtered only when that callback explicitly marks them disabled or unavailable,
-reports an authentication/authorization failure (including HTTP 401), or
-provides another explicit unusable status such as a future retry time. Account
-filenames, names, IDs, labels, paths, and credential JSON are never inspected
-for this decision; an available account whose name happens to contain `401`
-remains available. Idle
-available accounts show `0 / limit` usage, while active and idle accounts
-coexist. Labels prefer the auth email, then the CPA auth JSON filename/name,
-then a non-sensitive generic label; authority keys are never rendered. The
-callback is bounded; timeout, callback error, malformed data, or an
-empty/unusable list leaves the account list empty and marks the snapshot stale.
-Authority read failures likewise mark the snapshot stale without converting an
-unknown usage value to zero. This enrichment path never participates in
-admission. A
-timed-out callback remains the single in-flight worker; shutdown, reload, and
-reinitialization fence and join it before the host API is released or the
-plugin can be unloaded. The live UI accepts a CPA Management key in its
-Settings area, stores it only in browser-local storage scoped to the current
-origin, and sends it as `X-Management-Key` on usage requests. The plugin never
-requests or stores auth JSON, tokens, passwords, or the browser's management
-key, and the browser makes no separate auth-files request.
+## Admission and failover behavior
 
-The view also shows a top-level **All available accounts** summary. Its Total
-value is the sum of every displayed row's in-flight count and limit; its Warm
-reserved value is the corresponding sum of warm in-flight count and reserved
-slots. Filtered/unavailable accounts do not contribute to either sum. The
-per-account table remains exactly `Account`, `Total (in-flight / limit)`, and
-`Warm reserved (in-flight / reserved)`.
+The plugin acquires a lease only after CPA supplies the selected auth ID.
+Repeated post-auth callbacks for the same request are idempotent. When CPA
+retries or fails over to another account, the previous lease is released before
+the new lease is acquired, so leases do not stack across accounts.
 
-## Authority modes
+`request.complete` releases the final lease for successful requests, provider
+failures, stream termination, cancellation, timeout, client disconnect,
+rejection, and plugin errors. Admission waits at most `wait_timeout`.
 
-`local` is process-local and is the safe default for one CPA instance. `redis`
-uses atomic Lua `EVAL` scripts over RESP2 and requires `redis_addr` (with
-optional `redis_password` and `redis_db`). If a distributed authority is
-unavailable, the plugin fails closed with HTTP 503 and does not call the
-provider. Redis leases carry a bounded 30-second expiry and are renewed by a
-10-second heartbeat while the request is live. Acquire, expiry reclamation,
-renewal, and release are atomic; release is idempotent. If renewal or any
-authority operation is uncertain, new admissions fail closed until the plugin
-is reconfigured. A failed renewal fences that request locally; uncertainty is
-not cleared by reconfigure while its lease is still tracked, preventing a
-live, unrenewed request from being oversold to another lease.
-
-## Lifecycle and failover
-
-The lease is acquired only after CPA supplies the selected auth ID. Repeated
-post-auth hooks for the same request/account are idempotent. When CPA retries or
-fails over to another account, the prior lease is released before the new one
-is acquired, so leases never stack. `request.complete` releases the final lease
-exactly once for success, provider failure, stream EOF, WebSocket/turn end,
-timeout, cancellation, client disconnect, rejection, and plugin errors.
-
-The admission response is a direct response before executor/provider I/O:
+A local capacity rejection is returned before executor/provider I/O:
 
 ```http
 HTTP/1.1 503 Service Unavailable
@@ -109,48 +94,128 @@ Content-Type: application/json
 ```
 
 ```json
-{"error":{"type":"account_concurrency_limit","code":"account_concurrency_limit","message":"account concurrency limit reached","retryable":true}}
+{
+  "error": {
+    "type": "account_concurrency_limit",
+    "code": "account_concurrency_limit",
+    "message": "account concurrency limit reached",
+    "retryable": true
+  }
+}
 ```
 
-Authority failures use `account_concurrency_authority_unavailable` with the same
-HTTP status and retryable metadata. These local CPA errors are intentionally
-distinct from provider 429, provider health, performance-score, and breaker
-failures. Newapi should treat `account_concurrency_limit` as eligible for
-bounded channel-level failover, without classifying it as provider 429.
+Authority failures use the separate
+`account_concurrency_authority_unavailable` code. They are not provider 429
+responses and should not be treated as provider health or breaker failures.
 
-CPA host compatibility: schema version 2 or newer is required for terminal
-`request.complete` callbacks. This task's host/SDK contract adds
-`request_interceptor_enforces_admission` to registration capabilities. When it
-is true, interceptor RPC/process errors, fusing, unavailable callbacks, or an
-incompatible schema terminate the request with typed
-`account_concurrency_authority_unavailable` (HTTP 503); ordinary interceptors
-retain the historical fail-open behavior. The extension also adds `AuthID` and
-`AuthProvider` to post-auth interceptor requests and exposes plugin RPC error
-`Code`, `Class`, `Retryable`, and `StatusCode` methods. Hosts must preserve those
-typed fields across the plugin boundary; newapi must not parse human-readable
-messages.
+Redis leases use bounded expiry and heartbeat renewal. Uncertain authority
+operations fail closed; the plugin does not assume that a lost lease was safely
+released.
 
-Set the host-side plugin instance option `admission-enforcing: true` for this
-plugin. That explicit requirement keeps the provider path fail-closed while the
-plugin is loading or if registration fails; leave it unset for ordinary
-non-enforcement plugins.
+## Management observability
 
-Redis lease records are deliberately fail-closed across partitions. If renewal
-is lost, the plugin marks the account fenced in Redis; an acquire from any CPA
-instance returns `account_concurrency_authority_unavailable` (and an expired
-lease is fenced when observed) until the stale lease is explicitly released.
-Redis keys are therefore not reclaimed automatically: a crashed holder may
-require operational cleanup, which is the availability trade-off required to
-preserve the hard cap without relying on a local process flag.
+The usage view reads the authenticated CPA route:
 
-## Build and test
+```text
+/v0/management/plugins/cpa-account-concurrency/usage
+```
 
-From this directory:
+It uses CPA's stock `host.auth.list` callback as the account index and filters an
+entry only when explicit metadata marks it disabled, unavailable,
+unauthorized, authentication-failed, or inside a future retry window. Account
+names and filenames are not used as availability heuristics, so an available
+account whose name contains `401` remains visible.
+
+The view displays idle available accounts as `0 / limit` and `0 / reserved`.
+The table remains:
+
+- `Account`
+- `Total (in-flight / limit)`
+- `Warm reserved (in-flight / reserved)`
+
+The **All available accounts** summary sums only the rows shown in that table.
+Filtered or unavailable accounts do not contribute to the totals.
+
+The UI asks for the CPA Management key in its Settings area and stores it only
+in browser-local storage scoped to the current origin. The plugin does not
+request or store auth JSON, provider tokens, passwords, or the Management key.
+
+## Install the published release
+
+Download the assets from the public GitHub Release:
+
+<https://github.com/tsunheimat/cpa-courrency-plugin/releases/tag/v0.1.6>
+
+The Linux amd64 release contains:
+
+```text
+cpa-account-concurrency_0.1.6_linux_amd64.zip
+checksums.txt
+```
+
+Verify the archive before installation:
 
 ```bash
-/usr/local/go/bin/go test ./...
-/usr/local/go/bin/go build -buildmode=c-shared -o cpa-account-concurrency.so .
+sha256sum --check checksums.txt
+unzip -t cpa-account-concurrency_0.1.6_linux_amd64.zip
 ```
 
-Use the platform-specific shared-library suffix expected by CPA. The artifact
-filename must match the plugin ID (`cpa-account-concurrency`).
+The archive contains exactly this root-level library:
+
+```text
+cpa-account-concurrency.so
+```
+
+For manual installation, place the versioned library under the CLIProxyAPI
+plugin directory for the target platform:
+
+```text
+plugins/linux/amd64/cpa-account-concurrency-v0.1.6.so
+```
+
+Restart or reload CLIProxyAPI according to its normal plugin lifecycle after
+installation. The official CLIProxyAPI plugin store can install the same
+release after the registry entry is accepted.
+
+## Build the Linux amd64 package
+
+The release package is built as a native Go shared library:
+
+```bash
+GOOS=linux GOARCH=amd64 \
+  go build -trimpath -buildmode=c-shared \
+  -o cpa-account-concurrency.so .
+
+zip -X cpa-account-concurrency_0.1.6_linux_amd64.zip \
+  cpa-account-concurrency.so
+sha256sum cpa-account-concurrency_0.1.6_linux_amd64.zip > checksums.txt
+```
+
+The checked-in development module currently uses a local CLIProxyAPI SDK
+checkout through its `go.mod` replacement. Consequently, this source checkout
+is host-coupled for local development; the published release ZIP is the
+reproducible installation artifact for users who do not have that SDK checkout.
+The plugin itself does not require a CLIProxyAPI source modification.
+
+## Official plugin store
+
+This repository is prepared for submission to the official CLIProxyAPI plugin
+registry:
+
+<https://github.com/router-for-me/CLIProxyAPI-Plugins-Store>
+
+The official store maintains registry metadata only. Plugin binaries,
+`checksums.txt`, and release notes remain in this repository. Store inclusion is
+controlled by the upstream registry review and should not be assumed until the
+corresponding registry pull request is merged.
+
+## Security and trust
+
+Native plugins run in-process with CLIProxyAPI and must be treated as trusted
+code. Review the source and release checksum before installation. Do not commit
+provider credentials, Redis passwords, Management keys, cookies, or API tokens
+to this repository or to a release asset.
+
+## License
+
+MIT. See the repository license notice for the applicable terms.
