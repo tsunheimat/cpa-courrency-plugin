@@ -29,7 +29,7 @@ authenticated Management Center view of account usage.
 
 - Host: CLIProxyAPI/CPA with the native plugin ABI and request-lifecycle support.
 - Plugin ID: `cpa-account-concurrency`.
-- Current release: `v0.1.6`.
+- Current release: `v0.1.7`.
 - Published binary target in this repository: **Linux amd64**.
 
 Other operating systems and architectures are not published by the current
@@ -144,12 +144,12 @@ request or store auth JSON, provider tokens, passwords, or the Management key.
 
 Download the assets from the public GitHub Release:
 
-<https://github.com/tsunheimat/cpa-courrency-plugin/releases/tag/v0.1.6>
+<https://github.com/tsunheimat/cpa-courrency-plugin/releases/tag/v0.1.7>
 
 The Linux amd64 release contains:
 
 ```text
-cpa-account-concurrency_0.1.6_linux_amd64.zip
+cpa-account-concurrency_0.1.7_linux_amd64.zip
 checksums.txt
 ```
 
@@ -157,7 +157,7 @@ Verify the archive before installation:
 
 ```bash
 sha256sum --check checksums.txt
-unzip -t cpa-account-concurrency_0.1.6_linux_amd64.zip
+unzip -t cpa-account-concurrency_0.1.7_linux_amd64.zip
 ```
 
 The archive contains exactly this root-level library:
@@ -170,32 +170,32 @@ For manual installation, place the versioned library under the CLIProxyAPI
 plugin directory for the target platform:
 
 ```text
-plugins/linux/amd64/cpa-account-concurrency-v0.1.6.so
+plugins/linux/amd64/cpa-account-concurrency-v0.1.7.so
 ```
 
 Restart or reload CLIProxyAPI according to its normal plugin lifecycle after
 installation. The official CLIProxyAPI plugin store can install the same
 release after the registry entry is accepted.
 
-## Build the Linux amd64 package
+## Build and release provenance
 
-The release package is built as a native Go shared library:
+The CLIProxyAPI SDK is a public, versioned module dependency pinned in
+`go.mod`, with its checksums committed in `go.sum`. The project does not use a
+local SDK checkout or a `replace` directive.
+
+To run the same checks and Linux amd64 build used for release `v0.1.7`:
 
 ```bash
-GOOS=linux GOARCH=amd64 \
-  go build -trimpath -buildmode=c-shared \
-  -o cpa-account-concurrency.so .
-
-zip -X cpa-account-concurrency_0.1.6_linux_amd64.zip \
-  cpa-account-concurrency.so
-sha256sum cpa-account-concurrency_0.1.6_linux_amd64.zip > checksums.txt
+go mod tidy
+git diff --exit-code -- go.mod go.sum
+scripts/build-release.sh 0.1.7
+(cd dist && sha256sum --check checksums.txt)
 ```
 
-The checked-in development module currently uses a local CLIProxyAPI SDK
-checkout through its `go.mod` replacement. Consequently, this source checkout
-is host-coupled for local development; the published release ZIP is the
-reproducible installation artifact for users who do not have that SDK checkout.
-The plugin itself does not require a CLIProxyAPI source modification.
+The tag-triggered GitHub Actions workflow performs these checks from a clean
+checkout, uploads the resulting files as workflow evidence, and publishes them
+to the matching GitHub Release. See [`RELEASE.md`](RELEASE.md) for the complete
+process. The plugin does not require a CLIProxyAPI source modification.
 
 ## Official plugin store
 
