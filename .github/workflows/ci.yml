@@ -1,37 +1,45 @@
 name: CI
 
 on:
+  pull_request:
   push:
     branches: [main]
-  pull_request:
 
 permissions:
   contents: read
 
 jobs:
   test:
+    name: Test
     runs-on: ubuntu-24.04
     steps:
-      - name: Check out source
-        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
-      - name: Set up Go
-        uses: actions/setup-go@e626ada899467caf4efc6cfd0484b965da944ce8
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
+
       - name: Verify committed module files
         run: |
           go mod tidy
           git diff --exit-code -- go.mod go.sum
+
       - name: Verify modules
         run: go mod verify
+
       - name: Test
         run: go test ./...
+
       - name: Vet
         run: go vet ./...
 
-  build-platforms:
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
     needs: test
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
@@ -39,35 +47,41 @@ jobs:
           - goos: linux
             goarch: amd64
             runner: ubuntu-24.04
-            library: cpa-account-concurrency.so
+            ext: so
           - goos: linux
             goarch: arm64
             runner: ubuntu-24.04-arm
-            library: cpa-account-concurrency.so
+            ext: so
           - goos: darwin
             goarch: amd64
             runner: macos-15-intel
-            library: cpa-account-concurrency.dylib
+            ext: dylib
           - goos: darwin
             goarch: arm64
             runner: macos-15
-            library: cpa-account-concurrency.dylib
+            ext: dylib
           - goos: windows
             goarch: amd64
             runner: windows-2025
-            library: cpa-account-concurrency.dll
-    runs-on: ${{ matrix.runner }}
+            ext: dll
+    defaults:
+      run:
+        shell: bash
     steps:
-      - name: Check out source
-        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
-      - name: Set up Go
-        uses: actions/setup-go@e626ada899467caf4efc6cfd0484b965da944ce8
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
+
       - name: Build shared library
-        env:
-          CGO_ENABLED: "1"
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-        run: |\n          mkdir dist\n          go build -trimpath -buildmode=c-shared -ldflags="-buildid=" -o "dist/${{ matrix.library }}" .
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          CGO_ENABLED=1 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
+            go build -trimpath -buildmode=c-shared -ldflags="-buildid=" \
+              -o "dist/cpa-account-concurrency.${{ matrix.ext }}" .
+          rm -f dist/cpa-account-concurrency.h
