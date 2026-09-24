@@ -70,4 +70,4 @@ jobs:
           CGO_ENABLED: "1"
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
-        run: go build -trimpath -buildmode=c-shared -ldflags="-buildid=" -o "dist/${{ matrix.library }}" .
+        run: |\n          mkdir dist\n          go build -trimpath -buildmode=c-shared -ldflags="-buildid=" -o "dist/${{ matrix.library }}" .
