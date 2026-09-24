@@ -9,28 +9,134 @@ permissions:
   contents: write
 
 jobs:
-  release:
-    runs-on: ubuntu-latest
+  verify:
+    runs-on: ubuntu-24.04
     steps:
       - name: Check out tagged source
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
         with:
           fetch-depth: 0
       - name: Set up Go
-        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        uses: actions/setup-go@e626ada899467caf4efc6cfd0484b965da944ce8
         with:
           go-version-file: go.mod
           cache: true
+      - name: Verify release version
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          registered_version="$(sed -n 's/.*Version: "\([0-9][0-9.]*\)".*/\1/p' main.go | head -n 1)"
+          test "$registered_version" = "$version"
+          grep -Fq "\"version\": \"$version\"" registry.json
+          grep -Fq "Current release: \`v$version\`" README.md
       - name: Verify committed module files
         run: |
           go mod tidy
           git diff --exit-code -- go.mod go.sum
-      - name: Build release assets
-        run: scripts/build-release.sh "${GITHUB_REF_NAME#v}"
-      - name: Verify checksum
-        run: cd dist && sha256sum --check checksums.txt
+      - name: Verify modules
+        run: go mod verify
+      - name: Test
+        run: go test ./...
+      - name: Vet
+        run: go vet ./...
+
+  build:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            runner: ubuntu-24.04
+            library: cpa-account-concurrency.so
+          - goos: linux
+            goarch: arm64
+            runner: ubuntu-24.04-arm
+            library: cpa-account-concurrency.so
+          - goos: darwin
+            goarch: amd64
+            runner: macos-15-intel
+            library: cpa-account-concurrency.dylib
+          - goos: darwin
+            goarch: arm64
+            runner: macos-15
+            library: cpa-account-concurrency.dylib
+          - goos: windows
+            goarch: amd64
+            runner: windows-2025
+            library: cpa-account-concurrency.dll
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
+      - name: Set up Go
+        uses: actions/setup-go@e626ada899467caf4efc6cfd0484b965da944ce8
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build shared library
+        env:
+          CGO_ENABLED: "1"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: go build -trimpath -buildmode=c-shared -ldflags="-buildid=" -o "dist/${{ matrix.library }}" .
+      - name: Upload platform library
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: cpa-account-concurrency-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/${{ matrix.library }}
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
+      - name: Download platform libraries
+        uses: actions/download-artifact@484a0b528fb4d7bd804637ccb632e47a0e638317
+        with:
+          pattern: cpa-account-concurrency-*
+          path: staging
+          merge-multiple: false
+      - name: Package release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p dist package
+
+          package_target() {
+            local goos="$1"
+            local goarch="$2"
+            local library="$3"
+            local source="staging/cpa-account-concurrency-${goos}-${goarch}/${library}"
+            local archive="cpa-account-concurrency_${version}_${goos}_${goarch}.zip"
+
+            test -s "$source"
+            rm -rf package/*
+            cp "$source" "package/$library"
+            (
+              cd package
+              zip -X -q -9 "../dist/$archive" "$library"
+            )
+            test "$(unzip -Z1 "dist/$archive")" = "$library"
+          }
+
+          package_target linux amd64 cpa-account-concurrency.so
+          package_target linux arm64 cpa-account-concurrency.so
+          package_target darwin amd64 cpa-account-concurrency.dylib
+          package_target darwin arm64 cpa-account-concurrency.dylib
+          package_target windows amd64 cpa-account-concurrency.dll
+
+          (
+            cd dist
+            sha256sum cpa-account-concurrency_*.zip > checksums.txt
+            sha256sum --check checksums.txt
+          )
       - name: Upload build evidence
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: cpa-account-concurrency-${{ github.ref_name }}
           path: |
