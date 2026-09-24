@@ -17,12 +17,12 @@ jobs:
         shell: bash
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           fetch-depth: 0
 
       - name: Setup Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version-file: go.mod
           cache: true
@@ -82,10 +82,10 @@ jobs:
         shell: bash
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Setup Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version-file: go.mod
           cache: true
@@ -100,7 +100,7 @@ jobs:
           rm -f dist/cpa-account-concurrency.h
 
       - name: Upload platform library
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: cpa-account-concurrency-${{ matrix.goos }}-${{ matrix.goarch }}
           path: dist/cpa-account-concurrency.${{ matrix.ext }}
@@ -114,8 +114,11 @@ jobs:
       run:
         shell: bash
     steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
       - name: Download platform libraries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: cpa-account-concurrency-*
           path: staging
@@ -125,40 +128,10 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          mkdir -p dist package
-
-          package_target() {
-            local goos="$1"
-            local goarch="$2"
-            local ext="$3"
-            local library="cpa-account-concurrency.${ext}"
-            local source="staging/cpa-account-concurrency-${goos}-${goarch}/${library}"
-            local archive="cpa-account-concurrency_${version}_${goos}_${goarch}.zip"
-
-            test -s "$source"
-            rm -rf package/*
-            cp "$source" "package/$library"
-            (
-              cd package
-              zip -X -q -9 "../dist/$archive" "$library"
-            )
-            test "$(unzip -Z1 "dist/$archive")" = "$library"
-          }
-
-          package_target linux amd64 so
-          package_target linux arm64 so
-          package_target darwin amd64 dylib
-          package_target darwin arm64 dylib
-          package_target windows amd64 dll
-
-          (
-            cd dist
-            sha256sum cpa-account-concurrency_*.zip > checksums.txt
-            sha256sum --check checksums.txt
-          )
+          bash scripts/package-release-assets.sh "$version" staging dist
 
       - name: Upload release evidence
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: cpa-account-concurrency-${{ github.ref_name }}
           path: |
