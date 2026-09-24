@@ -24,9 +24,25 @@ if ! grep -Fq "Current release: \`v$version\`" README.md; then
   exit 1
 fi
 
+target_goos="${GOOS:-$(go env GOOS)}"
+target_goarch="${GOARCH:-$(go env GOARCH)}"
+
+case "$target_goos/$target_goarch" in
+  linux/amd64|linux/arm64|darwin/amd64|darwin/arm64|windows/amd64) ;;
+  *)
+    echo "unsupported plugin-store target: $target_goos/$target_goarch" >&2
+    exit 2
+    ;;
+esac
+
+case "$target_goos" in
+  linux) library="cpa-account-concurrency.so" ;;
+  darwin) library="cpa-account-concurrency.dylib" ;;
+  windows) library="cpa-account-concurrency.dll" ;;
+esac
+
 artifact_dir="${ARTIFACT_DIR:-dist}"
-archive="cpa-account-concurrency_${version}_linux_amd64.zip"
-library="cpa-account-concurrency.so"
+archive="cpa-account-concurrency_${version}_${target_goos}_${target_goarch}.zip"
 
 mkdir -p "$artifact_dir"
 rm -f "$artifact_dir/$archive" "$artifact_dir/$library" "$artifact_dir/checksums.txt"
@@ -36,17 +52,18 @@ go mod verify
 go test ./...
 go vet ./...
 
-CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
+CGO_ENABLED=1 GOOS="$target_goos" GOARCH="$target_goarch" \
   go build -trimpath -buildmode=c-shared -ldflags='-buildid=' \
   -o "$artifact_dir/$library" .
-
-source_date_epoch="${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct)}"
-touch -d "@$source_date_epoch" "$artifact_dir/$library"
 
 (
   cd "$artifact_dir"
   zip -X -q -9 "$archive" "$library"
-  sha256sum "$archive" > checksums.txt
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$archive" > checksums.txt
+  else
+    shasum -a 256 "$archive" > checksums.txt
+  fi
   test "$(unzip -Z1 "$archive")" = "$library"
 )
 
