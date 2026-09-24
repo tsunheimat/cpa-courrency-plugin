@@ -10,7 +10,14 @@ if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   exit 2
 fi
 
+if [[ ! -d "$staging_dir" ]]; then
+  echo "staging directory does not exist: $staging_dir" >&2
+  exit 1
+fi
+
 mkdir -p "$artifact_dir"
+staging_dir="$(cd "$staging_dir" && pwd)"
+artifact_dir="$(cd "$artifact_dir" && pwd)"
 rm -f "$artifact_dir"/cpa-account-concurrency_*.zip "$artifact_dir/checksums.txt"
 
 package_dir="$(mktemp -d)"
