@@ -14,7 +14,7 @@ published checksums; no local SDK checkout or module replacement is used.
    git diff --exit-code -- go.mod go.sum
    go test ./...
    go vet ./...
-   scripts/build-release.sh 0.1.7
+   GOOS=linux GOARCH=amd64 scripts/build-release.sh 0.1.8
    (cd dist && sha256sum --check checksums.txt)
    ```
 
@@ -22,13 +22,16 @@ published checksums; no local SDK checkout or module replacement is used.
 4. Create and push the matching tag, for example:
 
    ```bash
-   git tag -s v0.1.7 -m "Release v0.1.7"
-   git push origin v0.1.7
+   git tag -s v0.1.8 -m "Release v0.1.8"
+   git push origin v0.1.8
    ```
 
-The tag-triggered `Release` workflow reruns tests and vetting, builds the Linux
-amd64 shared library, creates `checksums.txt`, uploads the workflow artifact,
-and publishes both files to the GitHub Release. The Actions used by the
+The tag-triggered `Release` workflow reruns tests and vetting, then builds the
+five CPA Plugin Store required targets on native GitHub-hosted runners:
+Linux amd64/arm64, Darwin amd64/arm64, and Windows amd64. A final Linux job
+packages each platform library into its store-compatible ZIP, creates one
+combined `checksums.txt`, uploads the workflow evidence, and publishes all
+release assets. The Actions used by the
 workflow are pinned to full commit SHAs.
 
 ## Release assets
@@ -37,11 +40,14 @@ For version `X.Y.Z`, the release contains:
 
 ```text
 cpa-account-concurrency_X.Y.Z_linux_amd64.zip
+cpa-account-concurrency_X.Y.Z_linux_arm64.zip
+cpa-account-concurrency_X.Y.Z_darwin_amd64.zip
+cpa-account-concurrency_X.Y.Z_darwin_arm64.zip
+cpa-account-concurrency_X.Y.Z_windows_amd64.zip
 checksums.txt
 ```
 
-The ZIP contains exactly one root-level file:
-
-```text
-cpa-account-concurrency.so
-```
+Each ZIP contains exactly one root-level dynamic library. Linux archives contain
+`cpa-account-concurrency.so`, Darwin archives contain
+`cpa-account-concurrency.dylib`, and Windows archives contain
+`cpa-account-concurrency.dll`.
