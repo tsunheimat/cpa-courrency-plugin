@@ -63,7 +63,7 @@ func TestPluginRegistrationIncludesRequiredRepositoryMetadata(t *testing.T) {
 	if reg.Metadata.GitHubRepository != "https://github.com/tsunheimat/cpa-courrency-plugin" {
 		t.Fatalf("GitHubRepository = %q", reg.Metadata.GitHubRepository)
 	}
-	if reg.Metadata.Name != pluginID || reg.Metadata.Version != "0.1.7" || reg.Metadata.Author != "tsunheimat" || !reg.Capabilities.Scheduler || !reg.Capabilities.RequestInterceptorEnforcesAdmission {
+	if reg.Metadata.Name != pluginID || reg.Metadata.Version != "0.1.8" || reg.Metadata.Author != "tsunheimat" || !reg.Capabilities.Scheduler || !reg.Capabilities.RequestInterceptorEnforcesAdmission {
 		t.Fatalf("registration = %#v", reg)
 	}
 	if !reg.Capabilities.ManagementAPI {
